@@ -10,6 +10,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include "base64.h"
 
 #define FRAME_SIZE_8000  320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
@@ -42,6 +43,14 @@ public:
     void disconnect() {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "disconnecting...\n");
         client.disconnect();
+    }
+
+    /** Barge-in flush: drop all incoming audio until the server sends its
+     *  first non-audio (JSON) message, which signals the old TTS response
+     *  has ended.  Any audio frames that arrive while the flag is set are
+     *  silently discarded in eventCallback before reaching write_sbuffer. */
+    void discardIncomingAudio() {
+        m_discardAudio.store(true, std::memory_order_release);
     }
 
     bool isConnected() {
@@ -307,6 +316,15 @@ private:
         size_t remaining = bytes_out;
         const uint8_t *ptr = reinterpret_cast<const uint8_t *>(out_buf.data());
         while (remaining > 0) {
+            /* Bail out immediately if teardown has started.  Once close_requested
+               is set the write_frame_thread exits within one timer tick (~20 ms)
+               and stops draining write_sbuffer.  Spinning here with the session
+               read-lock held (from switch_core_session_locate in eventCallback)
+               would prevent FreeSWITCH from write-locking the session for
+               destruction, causing a permanent hung session. */
+            if (tech_pvt->close_requested || tech_pvt->cleanup_started) {
+                break;
+            }
             switch_size_t free_space = switch_buffer_freespace(tech_pvt->write_sbuffer);
             if (free_space == 0) {
                 switch_mutex_unlock(tech_pvt->write_mutex);
@@ -363,12 +381,31 @@ private:
 
             case MESSAGE:
                 if (pr.isRawAudio) {
-                    injectRawAudio(psession, pr.rawAudio, pr.sampleRate);
-                } else if (pr.ok == SWITCH_TRUE) {
-                    m_notify(psession, EVENT_PLAY, msg.c_str());
+                    if (m_discardAudio.load(std::memory_order_acquire)) {
+                        // Barge-in flush active: silently drop audio that
+                        // belonged to the interrupted response.
+                        break;
+                    }
+                    /* Guard against injecting audio on a dying channel.
+                       switch_channel_ready() returns false once hangup begins,
+                       so we avoid entering injectRawAudio when write_frame_thread
+                       has already stopped draining the buffer. */
+                    {
+                        switch_channel_t *ch = switch_core_session_get_channel(psession);
+                        if (ch && switch_channel_ready(ch)) {
+                            injectRawAudio(psession, pr.rawAudio, pr.sampleRate);
+                        }
+                    }
                 } else {
-                    // fall back to EVENT_JSON
-                    m_notify(psession, EVENT_JSON, msg.c_str());
+                    // Any non-audio message from the server means the old TTS
+                    // response has ended; re-enable audio injection.
+                    m_discardAudio.store(false, std::memory_order_release);
+                    if (pr.ok == SWITCH_TRUE) {
+                        m_notify(psession, EVENT_PLAY, msg.c_str());
+                    } else {
+                        // fall back to EVENT_JSON
+                        m_notify(psession, EVENT_JSON, msg.c_str());
+                    }
                 }
 
                 if (!m_suppress_log && !pr.isRawAudio) {
@@ -526,6 +563,9 @@ private:
     std::unordered_set<std::string> m_Files;
     std::atomic<bool> m_cleanedUp{false};
     std::mutex m_stateMutex;
+    // Barge-in: drop incoming raw audio until the server sends a non-audio
+    // message (which signals the old TTS response has ended).
+    std::atomic<bool> m_discardAudio{false};
 };
 
 
@@ -569,10 +609,13 @@ namespace {
 
         if (switch_core_codec_init(&write_codec, "L16", NULL, NULL, sample_rate, interval, channels,
                                    SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE, NULL,
-                                   switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-                              "Codec Activated L16@%uhz %u channels %dms\n", sample_rate, channels, interval);
+                                   switch_core_session_get_pool(session)) != SWITCH_STATUS_SUCCESS) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "write_frame_thread: Codec Init Failed. Cannot Start Write Thread\n");
+            return NULL;
         }
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                          "Codec Activated L16@%uhz %u channels %dms\n", sample_rate, channels, interval);
         write_frame.codec = &write_codec;
         write_frame.data = switch_core_session_alloc(session, SWITCH_RECOMMENDED_BUFFER_SIZE);
         write_frame.channels = channels;
@@ -595,7 +638,13 @@ namespace {
                 if (available >= bytes) {
                     write_frame.datalen = (uint32_t)switch_buffer_read(tech_pvt->write_sbuffer, write_frame.data, bytes);
                     write_frame.samples = write_frame.datalen / 2 / channels;
-                    switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
+                    /* Only write when the channel is still live. Skipping this check is the
+                       root cause of the hung-session bug: switch_core_session_write_frame()
+                       blocks acquiring the session I/O lock while the session teardown path
+                       holds it, causing a deadlock with stream_session_cleanup(). */
+                    if (switch_channel_ready(channel)) {
+                        switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
+                    }
                 }
                 switch_mutex_unlock(tech_pvt->write_mutex);
             }
@@ -833,6 +882,45 @@ extern "C" {
 
         switch_core_media_bug_flush(bug);
         tech_pvt->audio_paused = pause;
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    switch_status_t stream_session_flush(switch_core_session_t *session) {
+        switch_channel_t *channel = switch_core_session_get_channel(session);
+        auto *bug = (switch_media_bug_t*) switch_channel_get_private(channel, MY_BUG_NAME);
+        if (!bug) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "stream_session_flush failed because no bug\n");
+            return SWITCH_STATUS_FALSE;
+        }
+        auto *tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt) return SWITCH_STATUS_FALSE;
+
+        // 1. Zero the write buffer (audio already decoded and waiting to play).
+        // Commenting out for a moment
+        // switch_mutex_lock(tech_pvt->write_mutex);
+        // switch_buffer_zero(tech_pvt->write_sbuffer);
+        // switch_mutex_unlock(tech_pvt->write_mutex);
+
+        // 2. Discard audio still in transit from the WebSocket:
+        //    - signals the event thread to drain the input evbuffer
+        //      (TCP bytes received but not yet parsed)
+        //    - sets a discard flag that silently drops any raw audio frames
+        //      arriving after this point until the server sends a non-audio
+        //      message (indicating the interrupted response has ended).
+        std::shared_ptr<AudioStreamer> streamer;
+        switch_mutex_lock(tech_pvt->mutex);
+        if (tech_pvt->pAudioStreamer) {
+            auto* sp_wrap = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
+            if (sp_wrap && *sp_wrap) streamer = *sp_wrap;
+        }
+        switch_mutex_unlock(tech_pvt->mutex);
+
+        if (streamer) {
+            streamer->discardIncomingAudio();
+        }
+
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                          "stream_session_flush: write buffer cleared, incoming audio discarded\n");
         return SWITCH_STATUS_SUCCESS;
     }
 
@@ -1077,6 +1165,25 @@ extern "C" {
         return SWITCH_TRUE;
     }
 
+    switch_status_t stream_session_abort(void *pUserData) {
+        auto *tech_pvt = (private_t *)pUserData;
+        if (!tech_pvt) return SWITCH_STATUS_FALSE;
+
+        if (tech_pvt->pAudioStreamer) {
+            auto *sp_wrap = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
+            if (sp_wrap) {
+                if (*sp_wrap) {
+                    (*sp_wrap)->markCleanedUp();
+                    (*sp_wrap)->disconnect();
+                }
+                delete sp_wrap;
+            }
+            tech_pvt->pAudioStreamer = nullptr;
+        }
+        destroy_tech_pvt(tech_pvt);
+        return SWITCH_STATUS_SUCCESS;
+    }
+
     switch_status_t stream_session_cleanup(switch_core_session_t *session, char* text, int channelIsClosing) {
         switch_channel_t *channel = switch_core_session_get_channel(session);
         auto *bug = (switch_media_bug_t*) switch_channel_get_private(channel, MY_BUG_NAME);
@@ -1128,21 +1235,75 @@ extern "C" {
                 streamer->deleteFiles();
                 if (text) streamer->writeText(text);
 
+                /* markCleanedUp() nulls all callbacks first so no websocket
+                   event can fire into session context after this point. */
                 streamer->markCleanedUp();
-                streamer->disconnect();
-            }
 
-            if (write_thread) {
-                switch_status_t thread_status = SWITCH_STATUS_SUCCESS;
-                switch_status_t join_result = switch_thread_join(&thread_status, write_thread);
-                if (join_result != SWITCH_STATUS_SUCCESS) {
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-                                      "(%s) stream_session_cleanup: failed to join write thread (%d)\n",
-                                      sessionId, join_result);
+                if (!channelIsClosing) {
+                    /* Explicit stop (uuid_audio_stream stop): safe to
+                       disconnect synchronously - not in the session teardown
+                       path so there is no risk of blocking FreeSWITCH. */
+                    streamer->disconnect();
+                } else {
+                    /* Far-end hangup path: disconnect() performs a blocking
+                       WebSocket close handshake - it sends a CLOSE frame and
+                       waits for the server's response.  If the AI backend is
+                       slow or already gone this blocks indefinitely, which
+                       is the root cause of the hung session after our first
+                       fix removed the switch_thread_join deadlock.
+                       Move it to a detached thread so the session teardown
+                       path returns immediately.  The shared_ptr keeps the
+                       AudioStreamer alive until disconnect() completes. */
+                    std::thread([s = std::move(streamer)]() mutable {
+                        s->disconnect();
+                    }).detach();
                 }
             }
 
-            destroy_tech_pvt(tech_pvt);
+            if (write_thread) {
+                if (!channelIsClosing) {
+                    /* Explicit stop (uuid_audio_stream stop, etc.): safe to join because
+                       we are NOT in the session teardown path, so write_frame_thread can
+                       still call switch_core_session_write_frame() without deadlocking. */
+                    switch_status_t thread_status = SWITCH_STATUS_SUCCESS;
+                    switch_status_t join_result = switch_thread_join(&thread_status, write_thread);
+                    if (join_result != SWITCH_STATUS_SUCCESS) {
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                                          "(%s) stream_session_cleanup: failed to join write thread (%d)\n",
+                                          sessionId, join_result);
+                    }
+                } else {
+                    /* Far-end hangup path (channelIsClosing=1): called from SWITCH_ABC_TYPE_CLOSE
+                       while the FreeSWITCH session teardown holds the session I/O lock.
+                       Joining here would deadlock: write_frame_thread blocks inside
+                       switch_core_session_write_frame() waiting for that same lock.
+                       close_requested=1 (set above) causes the write thread to exit its loop
+                       within one timer tick (~20ms); switch_channel_ready() guards the actual
+                       write call so it never blocks on a dead channel. The thread exits safely
+                       before the session pool is freed. */
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                                      "(%s) stream_session_cleanup: skipping write thread join on channel close "
+                                      "(close_requested set, thread will self-exit)\n", sessionId);
+                }
+            }
+
+            if (!channelIsClosing) {
+                /* Full cleanup when we own the teardown. */
+                destroy_tech_pvt(tech_pvt);
+            } else {
+                /* Channel-closing path: only free heap-allocated resources.
+                   Pool-allocated objects (write_sbuffer, write_mutex, etc.) must remain
+                   valid until the write thread exits; they will be reclaimed with the
+                   session pool, which is freed after all callbacks complete. */
+                if (tech_pvt->read_resampler) {
+                    speex_resampler_destroy(tech_pvt->read_resampler);
+                    tech_pvt->read_resampler = nullptr;
+                }
+                if (tech_pvt->write_resampler) {
+                    speex_resampler_destroy(tech_pvt->write_resampler);
+                    tech_pvt->write_resampler = nullptr;
+                }
+            }
 
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%s) stream_session_cleanup: connection closed\n", sessionId);
             return SWITCH_STATUS_SUCCESS;

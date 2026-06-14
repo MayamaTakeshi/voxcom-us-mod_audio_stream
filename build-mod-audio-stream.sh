@@ -6,7 +6,7 @@
 #    && cd mod_audio_stream \
 #    && sudo bash ./build-mod-audio-stream.sh
 
-apt-get -y install libfreeswitch-dev libssl-dev zlib1g-dev libspeexdsp-dev
+apt-get -y install libfreeswitch-dev libssl-dev zlib1g-dev libevent-dev libspeexdsp-dev cmake
 
 git submodule init
 git submodule update
