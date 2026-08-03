@@ -316,12 +316,8 @@ private:
         size_t remaining = bytes_out;
         const uint8_t *ptr = reinterpret_cast<const uint8_t *>(out_buf.data());
         while (remaining > 0) {
-            /* Bail out immediately if teardown has started.  Once close_requested
-               is set the write_frame_thread exits within one timer tick (~20 ms)
-               and stops draining write_sbuffer.  Spinning here with the session
-               read-lock held (from switch_core_session_locate in eventCallback)
-               would prevent FreeSWITCH from write-locking the session for
-               destruction, causing a permanent hung session. */
+            /* Never spin here once teardown starts: we hold the session read lock
+               (from eventCallback), and nothing is draining write_sbuffer any more. */
             if (tech_pvt->close_requested || tech_pvt->cleanup_started) {
                 break;
             }
@@ -386,10 +382,7 @@ private:
                         // belonged to the interrupted response.
                         break;
                     }
-                    /* Guard against injecting audio on a dying channel.
-                       switch_channel_ready() returns false once hangup begins,
-                       so we avoid entering injectRawAudio when write_frame_thread
-                       has already stopped draining the buffer. */
+                    /* Don't inject into a dying channel - nothing drains it. */
                     {
                         switch_channel_t *ch = switch_core_session_get_channel(psession);
                         if (ch && switch_channel_ready(ch)) {
@@ -571,20 +564,36 @@ private:
 
 namespace {
 
+    /* Session-pool allocated. tech_pvt must be passed in, not looked up from the
+       channel private - cleanup nulls that before waiting. See CLAUDE.md. */
+    struct write_thread_args {
+        switch_core_session_t *session;
+        private_t *tech_pvt;
+    };
+
     void *SWITCH_THREAD_FUNC write_frame_thread(switch_thread_t *thread, void *obj) {
-        switch_core_session_t *session = (switch_core_session_t *)obj;
+        auto *args = (write_thread_args *)obj;
+        switch_core_session_t *session = args->session;
+        private_t *tech_pvt = args->tech_pvt;
+
+        /* Must be the first declaration: it publishes write_thread_done on every
+           return below, and (destroyed last) only after the timer and codec are gone. */
+        struct done_guard {
+            private_t *p;
+            ~done_guard() {
+                switch_mutex_lock(p->write_mutex);
+                p->write_thread_done = 1;
+                switch_mutex_unlock(p->write_mutex);
+            }
+        } guard{tech_pvt};
+
         switch_channel_t *channel = switch_core_session_get_channel(session);
         if (!channel) return NULL;
 
-        auto *bug = (switch_media_bug_t *)switch_channel_get_private(channel, MY_BUG_NAME);
-        if (!bug) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "no media bug in write frame thread\n");
-            return NULL;
-        }
-
-        private_t *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
-        if (!tech_pvt) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "write_frame_thread: missing tech_pvt\n");
+        /* Cleanup can win the race against our first instruction. */
+        if (tech_pvt->close_requested) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                              "write_frame_thread: close already requested, not starting\n");
             return NULL;
         }
 
@@ -638,10 +647,8 @@ namespace {
                 if (available >= bytes) {
                     write_frame.datalen = (uint32_t)switch_buffer_read(tech_pvt->write_sbuffer, write_frame.data, bytes);
                     write_frame.samples = write_frame.datalen / 2 / channels;
-                    /* Only write when the channel is still live. Skipping this check is the
-                       root cause of the hung-session bug: switch_core_session_write_frame()
-                       blocks acquiring the session I/O lock while the session teardown path
-                       holds it, causing a deadlock with stream_session_cleanup(). */
+                    /* Required: writing to a dying channel blocks on the session I/O
+                       lock that teardown holds, deadlocking cleanup. */
                     if (switch_channel_ready(channel)) {
                         switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
                     }
@@ -1008,11 +1015,38 @@ extern "C" {
 
     switch_status_t stream_session_write_thread_init(switch_core_session_t *session, void *pUserData) {
         private_t *tech_pvt = (private_t *)pUserData;
+        switch_memory_pool_t *pool = switch_core_session_get_pool(session);
         switch_threadattr_t *thd_attr = NULL;
-        switch_threadattr_create(&thd_attr, switch_core_session_get_pool(session));
-        switch_threadattr_detach_set(thd_attr, 0);
+        switch_status_t status;
+
+        auto *args = (write_thread_args *)switch_core_session_alloc(session, sizeof(write_thread_args));
+        if (!args) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "(%s) error allocating write thread args\n", tech_pvt->sessionId);
+            tech_pvt->write_thread = nullptr;
+            tech_pvt->write_thread_done = 1;
+            return SWITCH_STATUS_FALSE;
+        }
+        args->session = session;
+        args->tech_pvt = tech_pvt;
+
+        switch_threadattr_create(&thd_attr, pool);
+        /* Detached, NOT joinable: cleanup cannot join on the hangup path, and an
+           unjoined joinable thread leaks its stack mapping. See CLAUDE.md. */
+        switch_threadattr_detach_set(thd_attr, 1);
         switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
-        switch_thread_create(&tech_pvt->write_thread, thd_attr, write_frame_thread, session, switch_core_session_get_pool(session));
+        tech_pvt->write_thread_done = 0;
+
+        status = switch_thread_create(&tech_pvt->write_thread, thd_attr, write_frame_thread, args, pool);
+        if (status != SWITCH_STATUS_SUCCESS) {
+            /* apr_thread_create() leaves the handle set on failure; clearing it keeps
+               cleanup from waiting out the timeout for a thread that never ran. */
+            tech_pvt->write_thread = nullptr;
+            tech_pvt->write_thread_done = 1;
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "(%s) failed to create write frame thread (%d)\n", tech_pvt->sessionId, status);
+            return SWITCH_STATUS_FALSE;
+        }
         return SWITCH_STATUS_SUCCESS;
     }
 
@@ -1196,6 +1230,7 @@ extern "C" {
             std::shared_ptr<AudioStreamer>* sp_wrap = nullptr;
             std::shared_ptr<AudioStreamer> streamer;
             switch_thread_t *write_thread = nullptr;
+            int write_thread_exited = 1; /* no thread to wait for -> full cleanup */
 
             switch_mutex_lock(tech_pvt->mutex);
 
@@ -1235,66 +1270,77 @@ extern "C" {
                 streamer->deleteFiles();
                 if (text) streamer->writeText(text);
 
-                /* markCleanedUp() nulls all callbacks first so no websocket
-                   event can fire into session context after this point. */
+                /* Nulls all callbacks, so no websocket event can reach session
+                   context after this point. */
                 streamer->markCleanedUp();
 
                 if (!channelIsClosing) {
-                    /* Explicit stop (uuid_audio_stream stop): safe to
-                       disconnect synchronously - not in the session teardown
-                       path so there is no risk of blocking FreeSWITCH. */
+                    /* Not in the teardown path - safe to block on the close handshake. */
                     streamer->disconnect();
                 } else {
-                    /* Far-end hangup path: disconnect() performs a blocking
-                       WebSocket close handshake - it sends a CLOSE frame and
-                       waits for the server's response.  If the AI backend is
-                       slow or already gone this blocks indefinitely, which
-                       is the root cause of the hung session after our first
-                       fix removed the switch_thread_join deadlock.
-                       Move it to a detached thread so the session teardown
-                       path returns immediately.  The shared_ptr keeps the
-                       AudioStreamer alive until disconnect() completes. */
-                    std::thread([s = std::move(streamer)]() mutable {
-                        s->disconnect();
-                    }).detach();
+                    /* disconnect() blocks on the close handshake and a dead backend can
+                       stall it indefinitely, so hand it to a detached thread; the moved
+                       shared_ptr keeps the AudioStreamer alive until it finishes.
+                       The catch is load-bearing, not style: we unwind into a C frame
+                       (switch_core_media_bug_close), so an escaping exception would
+                       std::terminate all of FreeSWITCH. See CLAUDE.md. */
+                    try {
+                        std::thread([s = std::move(streamer)]() mutable {
+                            s->disconnect();
+                        }).detach();
+                    } catch (const std::exception &e) {
+                        /* streamer died with the closure; no synchronous fallback -
+                           that would block teardown, which is what we are avoiding. */
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                          "(%s) stream_session_cleanup: could not spawn disconnect "
+                                          "thread (%s); closing without handshake\n", sessionId, e.what());
+                    } catch (...) {
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                          "(%s) stream_session_cleanup: could not spawn disconnect "
+                                          "thread; closing without handshake\n", sessionId);
+                    }
                 }
             }
 
             if (write_thread) {
                 if (!channelIsClosing) {
-                    /* Explicit stop (uuid_audio_stream stop, etc.): safe to join because
-                       we are NOT in the session teardown path, so write_frame_thread can
-                       still call switch_core_session_write_frame() without deadlocking. */
-                    switch_status_t thread_status = SWITCH_STATUS_SUCCESS;
-                    switch_status_t join_result = switch_thread_join(&thread_status, write_thread);
-                    if (join_result != SWITCH_STATUS_SUCCESS) {
+                    /* destroy_tech_pvt() below frees write_mutex and write_sbuffer, so
+                       the thread must be out of its loop first. It is detached, so no
+                       join - wait on write_thread_done (normally ~20 ms). */
+                    int waited_ms = 0;
+                    for (;;) {
+                        switch_mutex_lock(tech_pvt->write_mutex);
+                        write_thread_exited = tech_pvt->write_thread_done;
+                        switch_mutex_unlock(tech_pvt->write_mutex);
+                        if (write_thread_exited || waited_ms >= WRITE_THREAD_EXIT_TIMEOUT_MS) break;
+                        switch_yield(5000); /* 5 ms */
+                        waited_ms += 5;
+                    }
+                    if (!write_thread_exited) {
                         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-                                          "(%s) stream_session_cleanup: failed to join write thread (%d)\n",
-                                          sessionId, join_result);
+                                          "(%s) stream_session_cleanup: write thread did not report exit within "
+                                          "%d ms; skipping destroy_tech_pvt to avoid use-after-free\n",
+                                          sessionId, WRITE_THREAD_EXIT_TIMEOUT_MS);
                     }
                 } else {
-                    /* Far-end hangup path (channelIsClosing=1): called from SWITCH_ABC_TYPE_CLOSE
-                       while the FreeSWITCH session teardown holds the session I/O lock.
-                       Joining here would deadlock: write_frame_thread blocks inside
-                       switch_core_session_write_frame() waiting for that same lock.
-                       close_requested=1 (set above) causes the write thread to exit its loop
-                       within one timer tick (~20ms); switch_channel_ready() guards the actual
-                       write call so it never blocks on a dead channel. The thread exits safely
-                       before the session pool is freed. */
+                    /* Cannot wait here: we are inside SWITCH_ABC_TYPE_CLOSE and the
+                       teardown holds the session I/O lock. The detached thread self-exits
+                       within a timer tick and needs no reclaiming.
+                       Best-effort only - nothing orders that exit against the session pool
+                       being freed. See CLAUDE.md. */
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-                                      "(%s) stream_session_cleanup: skipping write thread join on channel close "
-                                      "(close_requested set, thread will self-exit)\n", sessionId);
+                                      "(%s) stream_session_cleanup: not waiting for write thread on channel close "
+                                      "(close_requested set, detached thread will self-exit)\n", sessionId);
                 }
             }
 
-            if (!channelIsClosing) {
-                /* Full cleanup when we own the teardown. */
+            if (!channelIsClosing && write_thread_exited) {
                 destroy_tech_pvt(tech_pvt);
             } else {
-                /* Channel-closing path: only free heap-allocated resources.
-                   Pool-allocated objects (write_sbuffer, write_mutex, etc.) must remain
-                   valid until the write thread exits; they will be reclaimed with the
-                   session pool, which is freed after all callbacks complete. */
+                /* Write thread may still be live (hangup path, or the wait timed out).
+                   Leave write_mutex/write_sbuffer to the session pool, but the speex
+                   resamplers are malloc'd - the pool never reclaims them, and the write
+                   thread never touches them, so free them here. */
                 if (tech_pvt->read_resampler) {
                     speex_resampler_destroy(tech_pvt->read_resampler);
                     tech_pvt->read_resampler = nullptr;

@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 EXPOSE 8021/tcp
 EXPOSE 5060/udp
@@ -25,7 +25,7 @@ RUN apt update ; \
     vim \
     libodbc2 \
     libtpl0 \
-    libjwt0 \
+    libjwt2 \
     libmp3lame0 \
     libmpg123-0 \
     libshout3 \
@@ -40,8 +40,8 @@ RUN apt update ; \
 
 RUN apt upgrade -qq -y
 
-RUN echo "deb [signed-by=/usr/share/keyrings/signalwire-freeswitch-repo.gpg] https://files.freeswitch.org/repo/deb/debian-release/ bookworm main" > /etc/apt/sources.list.d/freeswitch.list
-RUN echo "deb-src [signed-by=/usr/share/keyrings/signalwire-freeswitch-repo.gpg] https://files.freeswitch.org/repo/deb/debian-release/ bookworm main" >> /etc/apt/sources.list.d/freeswitch.list
+RUN echo "deb [signed-by=/usr/share/keyrings/signalwire-freeswitch-repo.gpg] https://files.freeswitch.org/repo/deb/debian-release/ trixie main" > /etc/apt/sources.list.d/freeswitch.list
+RUN echo "deb-src [signed-by=/usr/share/keyrings/signalwire-freeswitch-repo.gpg] https://files.freeswitch.org/repo/deb/debian-release/ trixie main" >> /etc/apt/sources.list.d/freeswitch.list
 
 RUN if [ -z "${FREESWITCH_APT_LOGIN}" ] || [ -z "${FREESWITCH_APT_PASSWORD}" ]; then \
       echo "FREESWITCH_APT_LOGIN and FREESWITCH_APT_PASSWORD must be set" >&2; \

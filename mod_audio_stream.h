@@ -9,6 +9,10 @@
 #define MAX_WS_URI (4096)
 #define MAX_METADATA_LEN (8192)
 
+/* Cap on how long stream_session_cleanup() waits for write_frame_thread to exit
+   (normally ~20 ms, one timer tick). */
+#define WRITE_THREAD_EXIT_TIMEOUT_MS (2000)
+
 #define EVENT_CONNECT "mod_audio_stream::connect"
 #define EVENT_DISCONNECT "mod_audio_stream::disconnect"
 #define EVENT_ERROR "mod_audio_stream::error"
@@ -37,6 +41,9 @@ struct private_data
     switch_buffer_t *write_sbuffer;
     switch_mutex_t *write_mutex;
     switch_thread_t *write_thread;
+    /* Set by write_frame_thread on exit, read by cleanup; always under write_mutex.
+       Not a bitfield - those share a storage unit, so writes would race. */
+    int write_thread_done;
     int rtp_packets;
 };
 

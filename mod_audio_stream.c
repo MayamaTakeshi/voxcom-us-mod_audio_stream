@@ -113,6 +113,9 @@ static switch_status_t start_capture(switch_core_session_t *session,
     if (SWITCH_STATUS_FALSE == stream_session_write_thread_init(session, pUserData))
     {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "error initializing stream session write thread.\n");
+        /* Bug is already attached; tear it down rather than leave a stream that can
+           never play audio back. write_thread is NULL, so cleanup does not wait. */
+        stream_session_cleanup(session, NULL, 0);
         return SWITCH_STATUS_FALSE;
     }
     return SWITCH_STATUS_SUCCESS;
