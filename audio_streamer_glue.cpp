@@ -642,15 +642,23 @@ namespace {
         }
 
         while (!tech_pvt->close_requested && switch_core_session_running(session)) {
+            if (tech_pvt->use_write_replace) {
+                /* write_sbuffer is drained by stream_write_replace_frame() in
+                   the session's own write loop; draining it here too would
+                   consume each frame twice and double the playback rate. */
+                switch_core_timer_next(&timer);
+                continue;
+            }
             if (switch_mutex_trylock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS) {
                 switch_size_t available = switch_buffer_inuse(tech_pvt->write_sbuffer);
                 if (available >= bytes) {
                     write_frame.datalen = (uint32_t)switch_buffer_read(tech_pvt->write_sbuffer, write_frame.data, bytes);
                     write_frame.samples = write_frame.datalen / 2 / channels;
+                    switch_status_t wres = SWITCH_STATUS_SUCCESS;
                     /* Required: writing to a dying channel blocks on the session I/O
                        lock that teardown holds, deadlocking cleanup. */
                     if (switch_channel_ready(channel)) {
-                        switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
+                        wres = switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
                     }
                 }
                 switch_mutex_unlock(tech_pvt->write_mutex);
@@ -1008,6 +1016,15 @@ extern "C" {
             return SWITCH_STATUS_FALSE;
         }
 
+        /* Mono/mixed: deliver injected audio through the session's write loop
+           (SMBF_WRITE_REPLACE hook set in start_capture), never via the
+           write thread. Stereo falls back to the write thread path. */
+        if (channels == 1) {
+            tech_pvt->use_write_replace = 1;
+            tech_pvt->inject_scratch = (uint8_t *)switch_core_session_alloc(session, SWITCH_RECOMMENDED_BUFFER_SIZE);
+            tech_pvt->inject_scratch_size = SWITCH_RECOMMENDED_BUFFER_SIZE;
+        }
+
         *ppUserData = tech_pvt;
 
         return SWITCH_STATUS_SUCCESS;
@@ -1194,6 +1211,36 @@ extern "C" {
             if (!chunk.empty()) {
                 streamer->writeBinary(chunk.data(), chunk.size());
             }
+        }
+
+        return SWITCH_TRUE;
+    }
+
+    switch_bool_t stream_write_replace_frame(switch_media_bug_t *bug) {
+        switch_core_session_t *session = switch_core_media_bug_get_session(bug);
+        auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt || tech_pvt->close_requested || tech_pvt->cleanup_started) return SWITCH_TRUE;
+
+        switch_frame_t *frame = switch_core_media_bug_get_write_replace_frame(bug);
+        if (!frame || !frame->datalen) return SWITCH_TRUE;
+
+        const size_t bytes = frame->datalen;
+        if (!tech_pvt->inject_scratch || tech_pvt->inject_scratch_size < bytes) return SWITCH_TRUE;
+
+        size_t consumed = 0;
+        if (switch_mutex_trylock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS) {
+            if (switch_buffer_inuse(tech_pvt->write_sbuffer) >= bytes) {
+                consumed = switch_buffer_read(tech_pvt->write_sbuffer, tech_pvt->inject_scratch, bytes);
+            }
+            switch_mutex_unlock(tech_pvt->write_mutex);
+        }
+
+        if (consumed == bytes) {
+            /* Substitute only the data; keep the frame's codec/size so the
+               write-bug loop still hits the perfect-encode path. */
+            frame->data = tech_pvt->inject_scratch;
+            frame->datalen = (uint32_t)bytes;
+            frame->samples = (uint32_t)(bytes / 2 / tech_pvt->channels);
         }
 
         return SWITCH_TRUE;

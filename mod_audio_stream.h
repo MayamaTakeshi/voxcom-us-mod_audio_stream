@@ -36,6 +36,14 @@ struct private_data
     int audio_paused : 1;
     int close_requested : 1;
     int cleanup_started : 1;
+    /* When set (mono/mixed), injected audio is written into the session's own
+       write loop via SMBF_WRITE_REPLACE instead of the detatched write thread,
+       so it cannot lose the codec_write_mutex trylock race. */
+    int use_write_replace : 1;
+    /* Scratch buffer backing frames substituted by stream_write_replace_frame().
+       Session-pool allocated; reused synchronously inside the write loop. */
+    uint8_t *inject_scratch;
+    uint32_t inject_scratch_size;
     char initialMetadata[8192];
     switch_buffer_t *read_sbuffer;
     switch_buffer_t *write_sbuffer;

@@ -53,6 +53,10 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
         return stream_frame(bug);
         break;
 
+    case SWITCH_ABC_TYPE_WRITE_REPLACE:
+        return stream_write_replace_frame(bug);
+        break;
+
     case SWITCH_ABC_TYPE_WRITE:
     default:
         break;
@@ -74,6 +78,16 @@ static switch_status_t start_capture(switch_core_session_t *session,
 
     void *pUserData = NULL;
     int channels = (flags & SMBF_STEREO) ? 2 : 1;
+
+    /* Inject outgoing audio inside the session's own write loop (via
+       SMBF_WRITE_REPLACE) rather than from the detatched write thread; the
+       latter loses the codec_write_mutex trylock in switch_core_session_write_frame
+       to the session/collect threads and its frames get silently dropped.
+       Stereo is excluded: its interleaved buffers do not match the decoded
+       frame granularity. */
+    if (!(flags & SMBF_STEREO)) {
+        flags |= SMBF_WRITE_REPLACE;
+    }
 
     if (switch_channel_get_private(channel, MY_BUG_NAME))
     {
