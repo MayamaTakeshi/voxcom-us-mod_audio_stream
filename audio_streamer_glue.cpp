@@ -1,5 +1,7 @@
 #include <string>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include "mod_audio_stream.h"
 #include "WebSocketClient.h"
 #include <switch_json.h>
@@ -7,6 +9,7 @@
 #include <switch_buffer.h>
 #include <unordered_set>
 #include <atomic>
+#include <deque>
 #include <vector>
 #include <memory>
 #include <mutex>
@@ -15,6 +18,54 @@
 
 #define FRAME_SIZE_8000  320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
 
+/* Escape a string for embedding inside a double-quoted JSON string. Used for
+   the Gemini kickstart prompt (channel var STREAM_GEMINI_KICKSTART) which the
+   caller controls and may contain quotes/newlines. */
+static std::string json_escape(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (unsigned char c : s)
+    {
+        switch (c)
+        {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        default:
+            if (c < 0x20)
+            {
+                char buf[8];
+                snprintf(buf, sizeof(buf), "\\u%04x", c);
+                out += buf;
+            }
+            else
+            {
+                out += (char)c;
+            }
+        }
+    }
+    return out;
+}
+
 class AudioStreamer {
 public:
     // Factory
@@ -22,13 +73,15 @@ public:
         const char* uuid, const char* wsUri, responseHandler_t callback, int deflate, int heart_beat,
         bool suppressLog, const char* extra_headers, bool no_reconnect,
         const char* tls_cafile, const char* tls_keyfile,
-        const char* tls_certfile, bool tls_disable_hostname_validation) {
+        const char* tls_certfile, bool tls_disable_hostname_validation,
+        bool geminiMode, int geminiOutputRate, const char* geminiKickstart) {
 
         std::shared_ptr<AudioStreamer> sp(new AudioStreamer(
             uuid, wsUri, callback, deflate, heart_beat,
             suppressLog, extra_headers, no_reconnect,
             tls_cafile, tls_keyfile,
-            tls_certfile, tls_disable_hostname_validation
+            tls_certfile, tls_disable_hostname_validation,
+            geminiMode, geminiOutputRate, geminiKickstart
         ));
 
         sp->bindCallbacks(std::weak_ptr<AudioStreamer>(sp));
@@ -67,6 +120,61 @@ public:
         client.sendMessage(text, strlen(text));
     }
 
+    /* True when this connection speaks the Gemini Live (BidiGenerateContent)
+       protocol instead of the plain binary-PCM/streamAudio wire protocol. */
+    bool isGeminiMode() {
+        return m_geminiMode;
+    }
+
+    /* Gemini framing: wrap cooked caller PCM (already resampled to the
+       configured ws sampling rate) into a `realtimeInput` JSON frame. The
+       protocol forbids sending anything but the setup message before
+       `setupComplete` arrives, so frames received in that window are queued and
+       flushed by onSetupComplete(). */
+    void sendUpstreamAudio(const uint8_t* data, size_t len, int rate) {
+        if (!m_geminiMode || len == 0) return;
+        std::string b64 = base64_encode(data, len, false);
+        char mime[64];
+        snprintf(mime, sizeof(mime), "audio/pcm;rate=%d", rate);
+        std::string json = "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"";
+        json += mime;
+        json += "\",\"data\":\"";
+        json += b64;
+        json += "\"}}}";
+        enqueueUpstream(json);
+    }
+
+    /* Gemini: the server accepted the setup. Send the optional kickstart
+       greeting first (so the model starts talking), then any caller audio that
+       accumulated while setup was pending. */
+    void onSetupComplete() {
+        m_setupDone.store(true, std::memory_order_release);
+
+        std::deque<std::string> pending;
+        {
+            std::lock_guard<std::mutex> lk(m_stateMutex);
+            pending.swap(m_pendingUpstream);
+        }
+
+        if (!m_geminiKickstart.empty()) {
+            std::string kick = std::string("{\"clientContent\":{\"turns\":[{\"role\":\"user\",\"parts\":[{\"text\":\"")
+                + json_escape(m_geminiKickstart) + "\"}]}],\"turnComplete\":true}}";
+            writeText(kick.c_str());
+        }
+        for (auto &m : pending) {
+            writeText(m.c_str());
+        }
+    }
+
+    /* Gemini: polite end-of-stream cue before the websocket closes, so the
+       model finalizes the last turn/inference. */
+    void sendAudioStreamEnd() {
+        if (!m_geminiMode) return;
+        if (m_setupDone.load(std::memory_order_acquire)) {
+            writeText("{\"realtimeInput\":{\"audioStreamEnd\":true}}");
+        }
+    }
+
     void deleteFiles() {
         std::vector<std::string> files;
 
@@ -103,9 +211,12 @@ private:
         const char* uuid, const char* wsUri, responseHandler_t callback, int deflate, int heart_beat,
         bool suppressLog, const char* extra_headers, bool no_reconnect,
         const char* tls_cafile, const char* tls_keyfile,
-        const char* tls_certfile, bool tls_disable_hostname_validation
+        const char* tls_certfile, bool tls_disable_hostname_validation,
+        bool geminiMode, int geminiOutputRate, const char* geminiKickstart
     ) : m_sessionId(uuid), m_notify(callback), m_suppress_log(suppressLog),
-        m_extra_headers(extra_headers), m_playFile(0) {
+        m_extra_headers(extra_headers), m_playFile(0),
+        m_geminiMode(geminiMode), m_geminiOutputRate(geminiOutputRate),
+        m_geminiKickstart(geminiKickstart ? geminiKickstart : "") {
         (void)no_reconnect; // libwsc has no auto-reconnect; flag retained for API compatibility
 
         WebSocketHeaders hdrs;
@@ -266,6 +377,23 @@ private:
         }
     }
 
+    /* Gemini pre-setup window: the protocol rejects any client frame before
+       setupComplete. Queue the JSON text frames in order and flush them once
+       onSetupComplete() fires. The queue is bounded so a dead/never-replying
+       peer cannot grow memory without limit. */
+    void enqueueUpstream(const std::string& json) {
+        if (m_setupDone.load(std::memory_order_acquire)) {
+            writeText(json.c_str());
+            return;
+        }
+        std::lock_guard<std::mutex> lk(m_stateMutex);
+        m_pendingUpstream.push_back(json);
+        /* ~20 ms frames; cap at ~10 s of buffered audio. */
+        while (m_pendingUpstream.size() > 500) {
+            m_pendingUpstream.pop_front();
+        }
+    }
+
     void injectRawAudio(switch_core_session_t *session, const std::vector<uint8_t>& rawAudio, int sampleRate) {
         auto *bug = get_media_bug(session);
         if (!bug) return;
@@ -422,6 +550,12 @@ private:
         jsonPtr root(cJSON_Parse(message.c_str()), &cJSON_Delete);
         if (!root) return out;
 
+        // Gemini Live framing: the server speaks the native
+        // BidiGenerateContent protocol (no "type": "streamAudio" envelope).
+        if (m_geminiMode) {
+            return processGeminiMessage(root.get(), message);
+        }
+
         const char* jsonType = cJSON_GetObjectCstr(root.get(), "type");
         if (!jsonType || std::strcmp(jsonType, "streamAudio") != 0) {
             return out; // not ours
@@ -546,6 +680,92 @@ private:
         return out;
     }
 
+    /* Parse a raw Gemini Live server frame. Recognized shapes:
+       reason: cancel / error / finished / maxTurns (end the session), otherwise
+       reason: unspecified/startOfTurn/etc. (keep running). We do not end the
+       session here: the caller decides when a call finishes. */
+    ProcessResult processGeminiMessage(cJSON* root, const std::string& message) {
+        ProcessResult out;
+
+        // setupComplete: the server accepted our setup; flush pending upstream.
+        if (cJSON_GetObjectItem(root, "setupComplete")) {
+            onSetupComplete();
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                              "gemini session %s: setup complete\n", m_sessionId.c_str());
+        }
+
+        // server errors: surface them via the err handling in eventCallback.
+        cJSON* jsonError = cJSON_GetObjectItem(root, "error");
+        if (jsonError) {
+            const char* em = cJSON_GetObjectCstr(jsonError, "message");
+            push_err(out, m_sessionId,
+                     std::string("Gemini error: ") + (em ? em : "<no message>"));
+            return out;
+        }
+
+        // serverContent: model audio / turn lifecycle.
+        cJSON* serverContent = cJSON_GetObjectItem(root, "serverContent");
+        if (serverContent) {
+            cJSON* interrupted = cJSON_GetObjectItem(serverContent, "interrupted");
+            if (interrupted && cJSON_IsTrue(interrupted)) {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                                  "gemini session %s: turn interrupted (barge-in)\n",
+                                  m_sessionId.c_str());
+                /* The in-flight injected audio belongs to the cut-off turn; we
+                   leave the write buffer alone and rely on the next turn's
+                   audio. */
+            }
+
+            cJSON* modelTurn = cJSON_GetObjectItem(serverContent, "modelTurn");
+            if (modelTurn) {
+                cJSON* parts = cJSON_GetObjectItem(modelTurn, "parts");
+                if (parts && cJSON_IsArray(parts)) {
+                    std::string rawAudio;
+                    int sampleRate = m_geminiOutputRate;
+                    bool decodeError = false;
+                    int count = cJSON_GetArraySize(parts);
+                    for (int i = 0; i < count; i++) {
+                        cJSON* part = cJSON_GetArrayItem(parts, i);
+                        if (!part) continue;
+                        cJSON* inlineData = cJSON_GetObjectItem(part, "inlineData");
+                        if (!inlineData) continue; /* e.g. only text parts */
+                        const char* data = cJSON_GetObjectCstr(inlineData, "data");
+                        if (!data) continue;
+                        const char* mime = cJSON_GetObjectCstr(inlineData, "mimeType");
+                        if (mime) {
+                            /* mimeType: "audio/pcm;rate=24000" */
+                            const char* p = std::strstr(mime, "rate=");
+                            if (p) {
+                                int r = std::atoi(p + 5);
+                                if (r > 0) sampleRate = r;
+                            }
+                        }
+                        try {
+                            std::string decoded = base64_decode(data);
+                            rawAudio += decoded;
+                        } catch (const std::exception& e) {
+                            decodeError = true;
+                            push_err(out, m_sessionId,
+                                     std::string("Gemini base64 decode error: ") + e.what());
+                            break;
+                        }
+                    }
+                    if (!decodeError && !rawAudio.empty()) {
+                        out.isRawAudio = true;
+                        out.sampleRate = sampleRate;
+                        out.rawAudio.assign(
+                            reinterpret_cast<const uint8_t*>(rawAudio.data()),
+                            reinterpret_cast<const uint8_t*>(rawAudio.data()) + rawAudio.size());
+                    }
+                }
+            }
+            return out;
+        }
+
+        // Everything else (e.g. usageMetadata-only frames, keepalive) is a no-op.
+        return out;
+    }
+
 private:
     std::string m_sessionId;
     responseHandler_t m_notify;
@@ -559,6 +779,12 @@ private:
     // Barge-in: drop incoming raw audio until the server sends a non-audio
     // message (which signals the old TTS response has ended).
     std::atomic<bool> m_discardAudio{false};
+    // Gemini Live (BidiGenerateContent) framing state.
+    bool m_geminiMode = false;
+    int m_geminiOutputRate = 24000;
+    std::string m_geminiKickstart;
+    std::atomic<bool> m_setupDone{false};
+    std::deque<std::string> m_pendingUpstream;
 };
 
 
