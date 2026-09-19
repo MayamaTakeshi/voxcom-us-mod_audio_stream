@@ -927,7 +927,9 @@ namespace {
         auto sp = AudioStreamer::create(tech_pvt->sessionId, wsUri, responseHandler, deflate, heart_beat,
                                         suppressLog, extra_headers, no_reconnect,
                                         tls_cafile, tls_keyfile,
-                                        tls_certfile, tls_disable_hostname_validation);
+                                        tls_certfile, tls_disable_hostname_validation,
+                                        /* geminiMode */ false, /* geminiOutputRate */ 24000,
+                                        /* geminiKickstart */ nullptr);
 
         tech_pvt->pAudioStreamer = new std::shared_ptr<AudioStreamer>(sp);
 
