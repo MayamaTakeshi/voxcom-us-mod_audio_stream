@@ -315,23 +315,20 @@ private:
 
         size_t remaining = bytes_out;
         const uint8_t *ptr = reinterpret_cast<const uint8_t *>(out_buf.data());
-        while (remaining > 0) {
-            /* Never spin here once teardown starts: we hold the session read lock
-               (from eventCallback), and nothing is draining write_sbuffer any more. */
-            if (tech_pvt->close_requested || tech_pvt->cleanup_started) {
-                break;
-            }
-            switch_size_t free_space = switch_buffer_freespace(tech_pvt->write_sbuffer);
-            if (free_space == 0) {
-                switch_mutex_unlock(tech_pvt->write_mutex);
-                switch_yield(10000);
-                if (switch_mutex_lock(tech_pvt->write_mutex) != SWITCH_STATUS_SUCCESS) return;
-                continue;
-            }
-            size_t chunk = std::min<size_t>(remaining, free_space);
-            switch_buffer_write(tech_pvt->write_sbuffer, ptr, chunk);
-            ptr += chunk;
-            remaining -= chunk;
+        switch_size_t free_space = switch_buffer_freespace(tech_pvt->write_sbuffer);
+        if (free_space == 0) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                              "%s injectRawAudio: write buffer full, dropping %zu bytes\n",
+                              tech_pvt->sessionId, remaining);
+            switch_mutex_unlock(tech_pvt->write_mutex);
+            return;
+        }
+        size_t chunk = std::min<size_t>(remaining, free_space);
+        switch_buffer_write(tech_pvt->write_sbuffer, ptr, chunk);
+        if (chunk < remaining) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                              "%s injectRawAudio: write buffer partially full, dropped %zu of %zu bytes\n",
+                              tech_pvt->sessionId, remaining - chunk, remaining);
         }
 
         switch_mutex_unlock(tech_pvt->write_mutex);
@@ -696,7 +693,12 @@ namespace {
         if (metadata) strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN);
 
         //size_t buflen = (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * 1000 / RTP_PERIOD * BUFFERED_SEC);
-        const size_t buflen = (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * rtp_packets);
+        const size_t read_buflen = (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * rtp_packets);
+
+        /* write_sbuffer holds resampled audio at the session codec rate (sampling).
+           Size it to 2 seconds so burst audio from the server (e.g. pipecat binary
+           frames) is never dropped before stream_write_replace_frame drains it. */
+        const size_t write_buflen = (FRAME_SIZE_8000 * sampling / 8000 * channels * 100);
         
         auto sp = AudioStreamer::create(tech_pvt->sessionId, wsUri, responseHandler, deflate, heart_beat,
                                         suppressLog, extra_headers, no_reconnect,
@@ -708,13 +710,13 @@ namespace {
         switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, pool);
         switch_mutex_init(&tech_pvt->write_mutex, SWITCH_MUTEX_NESTED, pool);
 
-        if (switch_buffer_create(pool, &tech_pvt->read_sbuffer, buflen) != SWITCH_STATUS_SUCCESS) {
+        if (switch_buffer_create(pool, &tech_pvt->read_sbuffer, read_buflen) != SWITCH_STATUS_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                 "%s: Error creating read switch buffer.\n", tech_pvt->sessionId);
             return SWITCH_STATUS_FALSE;
         }
 
-        if (switch_buffer_create(pool, &tech_pvt->write_sbuffer, buflen) != SWITCH_STATUS_SUCCESS) {
+        if (switch_buffer_create(pool, &tech_pvt->write_sbuffer, write_buflen) != SWITCH_STATUS_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                 "%s: Error creating write switch buffer.\n", tech_pvt->sessionId);
             return SWITCH_STATUS_FALSE;
