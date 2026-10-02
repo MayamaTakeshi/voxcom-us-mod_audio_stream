@@ -40,13 +40,13 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
     {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Got SWITCH_ABC_TYPE_CLOSE.\n");
         // Check if this is a normal channel closure or a requested closure
-        channel_closing = tech_pvt->close_requested ? 0 : 1;
+        channel_closing = switch_atomic_read(&tech_pvt->close_requested) ? 0 : 1;
         stream_session_cleanup(session, NULL, channel_closing);
     }
     break;
 
     case SWITCH_ABC_TYPE_READ:
-        if (tech_pvt->close_requested)
+        if (switch_atomic_read(&tech_pvt->close_requested))
         {
             return SWITCH_FALSE;
         }
@@ -132,6 +132,12 @@ static switch_status_t start_capture(switch_core_session_t *session,
         stream_session_cleanup(session, NULL, 0);
         return SWITCH_STATUS_FALSE;
     }
+    if (SWITCH_STATUS_FALSE == stream_session_connect(pUserData))
+    {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "error connecting stream session.\n");
+        stream_session_cleanup(session, NULL, 0);
+        return SWITCH_STATUS_FALSE;
+    }
     return SWITCH_STATUS_SUCCESS;
 }
 
@@ -186,7 +192,7 @@ static switch_status_t send_text(switch_core_session_t *session, char *text)
     return status;
 }
 
-#define STREAM_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | flush | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000] [metadata]"
+#define STREAM_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | flush] [wss-url | path] [mono | mixed | stereo] [8000 | 16000] [metadata]"
 SWITCH_STANDARD_API(stream_function)
 {
     char *mycmd = NULL, *argv[6] = {0};
@@ -198,7 +204,6 @@ SWITCH_STANDARD_API(stream_function)
     {
         argc = switch_separate_string(mycmd, ' ', argv, (sizeof(argv) / sizeof(argv[0])));
     }
-    assert(cmd);
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "mod_audio_stream cmd: %s\n", cmd ? cmd : "");
 
     if (zstr(cmd) || argc < 2 || (0 == strcmp(argv[1], "start") && argc < 4))

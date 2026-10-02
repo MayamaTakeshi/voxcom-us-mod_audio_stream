@@ -1,3 +1,0 @@
-[submodule "libs/libwsc"]
-	path = libs/libwsc
-	url = https://github.com/amigniter/libwsc

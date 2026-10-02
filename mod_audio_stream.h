@@ -33,18 +33,19 @@ struct private_data
     int sampling;
     int wsSampling;
     int channels;
-    int audio_paused : 1;
-    int close_requested : 1;
-    int cleanup_started : 1;
+    volatile switch_atomic_t audio_paused;
+    volatile switch_atomic_t close_requested;
+    volatile switch_atomic_t cleanup_started;
     /* When set (mono/mixed), injected audio is written into the session's own
        write loop via SMBF_WRITE_REPLACE instead of the detatched write thread,
        so it cannot lose the codec_write_mutex trylock race. */
-    int use_write_replace : 1;
+    volatile switch_atomic_t use_write_replace;
     /* Scratch buffer backing frames substituted by stream_write_replace_frame().
        Session-pool allocated; reused synchronously inside the write loop. */
     uint8_t *inject_scratch;
     uint32_t inject_scratch_size;
-    char initialMetadata[8192];
+    uint32_t write_frame_bytes;
+    char initialMetadata[MAX_METADATA_LEN];
     switch_buffer_t *read_sbuffer;
     switch_buffer_t *write_sbuffer;
     switch_mutex_t *write_mutex;
