@@ -279,7 +279,15 @@ private:
 
         if (rawAudio.empty() || channels <= 0) return;
 
-        spx_uint32_t in_frames = (spx_uint32_t)(rawAudio.size() / (sizeof(spx_int16_t) * channels));
+        const size_t bytes_per_frame = sizeof(spx_int16_t) * (size_t)channels;
+        if (rawAudio.size() % bytes_per_frame != 0) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                              "%s injectRawAudio: dropping malformed audio payload of %zu bytes\n",
+                              tech_pvt->sessionId, rawAudio.size());
+            return;
+        }
+
+        spx_uint32_t in_frames = (spx_uint32_t)(rawAudio.size() / bytes_per_frame);
         if (in_frames == 0) return;
 
         spx_uint32_t max_out = (spx_uint32_t)((double)in_frames * outRate / inRate) + 1;
@@ -776,6 +784,15 @@ namespace {
 
 extern "C" {
     int validate_ws_uri(const char* url, char* wsUri) {
+        if (!url || !wsUri) {
+            return 0;
+        }
+
+        const size_t url_len = std::strlen(url);
+        if (url_len >= MAX_WS_URI) {
+            return 0;
+        }
+
         const char* scheme = nullptr;
         const char* hostStart = nullptr;
         const char* hostEnd = nullptr;
@@ -818,7 +835,8 @@ extern "C" {
         }
 
         // Copy valid URI to wsUri
-        std::strncpy(wsUri, url, MAX_WS_URI);
+        std::memcpy(wsUri, url, url_len);
+        wsUri[url_len] = '\0';
         return 1;
     }
 
@@ -950,7 +968,7 @@ extern "C" {
                                         char* metadata,
                                         void **ppUserData)
     {
-        int deflate, heart_beat;
+        int deflate = 0, heart_beat = 0;
         bool suppressLog = false;
         bool no_reconnect = false;
         const char* buffer_size;

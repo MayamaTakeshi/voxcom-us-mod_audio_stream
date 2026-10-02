@@ -260,10 +260,10 @@ SWITCH_STANDARD_API(stream_function)
                 int wsSampling = 8000;
                 switch_media_bug_flag_t flags = SMBF_READ_STREAM;
                 char *metadata = argc > 5 ? argv[5] : NULL;
-                if (metadata && (is_valid_utf8(argv[2]) != SWITCH_STATUS_SUCCESS))
+                if (metadata && (is_valid_utf8(metadata) != SWITCH_STATUS_SUCCESS))
                 {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                      "%s contains invalid utf8 characters\n", argv[2]);
+                                      "%s contains invalid utf8 characters\n", metadata);
                     switch_core_session_rwunlock(lsession);
                     goto done;
                 }
@@ -295,18 +295,23 @@ SWITCH_STANDARD_API(stream_function)
                     }
                     else
                     {
-                        wsSampling = atoi(argv[4]);
+                        char *endptr = NULL;
+                        long parsedSampling = strtol(argv[4], &endptr, 10);
+                        if (!endptr || endptr == argv[4] || *endptr != '\0' ||
+                            (parsedSampling != 8000 && parsedSampling != 16000))
+                        {
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                              "invalid sample rate: %s, must be 8000 or 16000\n", argv[4]);
+                            switch_core_session_rwunlock(lsession);
+                            goto done;
+                        }
+                        wsSampling = (int)parsedSampling;
                     }
                 }
                 if (!validate_ws_uri(argv[2], &wsUri[0]))
                 {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                                       "invalid websocket uri: %s\n", argv[2]);
-                }
-                else if (wsSampling % 8000 != 0)
-                {
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                      "invalid sample rate: %s\n", argv[4]);
                 }
                 else
                 {
