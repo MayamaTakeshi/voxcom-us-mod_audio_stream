@@ -113,6 +113,11 @@ public:
     void disconnect();
 
     /**
+     * \brief Request graceful shutdown without waiting for the event thread.
+     */
+    void disconnectAsync();
+
+    /**
      * \brief Check whether the client is currently connected.
      *
      * \return true if the client is connected, false otherwise.

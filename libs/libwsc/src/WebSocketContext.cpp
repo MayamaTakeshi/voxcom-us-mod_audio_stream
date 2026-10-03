@@ -307,6 +307,14 @@ void WebSocketContext::stop() {
     }
 }
 
+void WebSocketContext::stopAsync() {
+    stop_requested.store(true, std::memory_order_release);
+    requestWakeup();
+    if (event_thread.joinable()) {
+        event_thread.detach();
+    }
+}
+
 void WebSocketContext::stopNow() {
     auto st = connection_state.load(std::memory_order_acquire);
     if (st == ConnectionState::DISCONNECTING || st == ConnectionState::DISCONNECTED) {

@@ -264,3 +264,13 @@ void WebSocketClient::disconnect() {
     }
     if (ctx) ctx->stop();
 }
+
+void WebSocketClient::disconnectAsync() {
+    if (!_ctx_mutex) return;
+    std::shared_ptr<WebSocketContext> ctx;
+    {
+        std::lock_guard<std::mutex> lk(*_ctx_mutex);
+        ctx = std::move(_ctx);
+    }
+    if (ctx) ctx->stopAsync();
+}

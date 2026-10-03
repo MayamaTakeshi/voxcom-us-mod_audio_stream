@@ -83,6 +83,7 @@ public:
 
     void start();
     void stop();
+    void stopAsync();
 
     // IWebSocketSinks overrides
     bool rxCompressionEnabled() const override;

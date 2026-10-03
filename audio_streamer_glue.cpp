@@ -7,13 +7,13 @@
 #include <switch_buffer.h>
 #include <arpa/inet.h>
 #include <unordered_set>
+#include <unordered_map>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <vector>
 #include <memory>
 #include <mutex>
-#include <thread>
 #include "base64.h"
 
 #define FRAME_SIZE_8000  320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
@@ -41,15 +41,17 @@ public:
 
     ~AudioStreamer() {
         deleteFiles();
+        for (auto& entry : m_writeResamplers) {
+            speex_resampler_destroy(entry.second);
+        }
     }
 
     void connect() {
         client.connect();
     }
 
-    void disconnect() {
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "disconnecting...\n");
-        client.disconnect();
+    void disconnectAsync() {
+        client.disconnectAsync();
     }
 
     /** Barge-in flush: discard stale incoming audio until the next non-audio
@@ -283,6 +285,24 @@ private:
         }
     }
 
+    SpeexResamplerState* get_write_resampler(int input_rate, switch_core_session_t* session) {
+        auto found = m_writeResamplers.find(input_rate);
+        if (found != m_writeResamplers.end()) return found->second;
+
+        int err = RESAMPLER_ERR_SUCCESS;
+        SpeexResamplerState* resampler = speex_resampler_init(
+            m_techPvt->channels, input_rate, m_techPvt->sampling, SWITCH_RESAMPLE_QUALITY, &err);
+        if (err != RESAMPLER_ERR_SUCCESS) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "%s: cannot initialize %d-to-%d resampler: %s\n",
+                              m_techPvt->sessionId, input_rate, m_techPvt->sampling,
+                              speex_resampler_strerror(err));
+            return nullptr;
+        }
+        m_writeResamplers.emplace(input_rate, resampler);
+        return resampler;
+    }
+
     void injectRawAudio(switch_core_session_t *session, const std::vector<uint8_t>& rawAudio, int sampleRate) {
         auto *tech_pvt = m_techPvt;
         switch_mutex_lock(tech_pvt->mutex);
@@ -324,19 +344,13 @@ private:
         spx_uint32_t in_len = in_frames;
         spx_uint32_t out_len = max_out;
 
-        SpeexResamplerState* temporary_resampler = nullptr;
         SpeexResamplerState* resampler = tech_pvt->write_resampler;
         if (inRate != outRate && inRate != tech_pvt->wsSampling) {
-            int err = RESAMPLER_ERR_SUCCESS;
-            temporary_resampler = speex_resampler_init(channels, inRate, outRate, SWITCH_RESAMPLE_QUALITY, &err);
-            if (err != RESAMPLER_ERR_SUCCESS) {
-                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                  "%s injectRawAudio: cannot initialize %d-to-%d resampler: %s\n",
-                                  tech_pvt->sessionId, inRate, outRate, speex_resampler_strerror(err));
+            resampler = get_write_resampler(inRate, session);
+            if (!resampler) {
                 switch_mutex_unlock(tech_pvt->mutex);
                 return;
             }
-            resampler = temporary_resampler;
         }
 
         if (inRate == outRate || !resampler) {
@@ -352,8 +366,6 @@ private:
                                                     in_buf.data(), &in_len,
                                                     out_buf.data(), &out_len);
         }
-        if (temporary_resampler) speex_resampler_destroy(temporary_resampler);
-
         const size_t bytes_out = (size_t)out_len * (size_t)channels * sizeof(spx_int16_t);
 
         if (switch_mutex_lock(tech_pvt->write_mutex) != SWITCH_STATUS_SUCCESS) {
@@ -632,6 +644,7 @@ private:
     std::string m_extra_headers;
     int m_playFile;
     std::unordered_set<std::string> m_Files;
+    std::unordered_map<int, SpeexResamplerState*> m_writeResamplers;
     std::atomic<bool> m_cleanedUp{false};
     std::mutex m_stateMutex;
     // Barge-in: discard stale raw audio until a non-audio message or timeout.
@@ -1387,7 +1400,7 @@ extern "C" {
             if (sp_wrap) {
                 if (*sp_wrap) {
                     (*sp_wrap)->markCleanedUp();
-                    (*sp_wrap)->disconnect();
+                    (*sp_wrap)->disconnectAsync();
                 }
                 delete sp_wrap;
             }
@@ -1469,32 +1482,9 @@ extern "C" {
                    context after this point. */
                 streamer->markCleanedUp();
 
-                if (!channelIsClosing) {
-                    /* Not in the teardown path - safe to block on the close handshake. */
-                    streamer->disconnect();
-                } else {
-                    /* disconnect() blocks on the close handshake and a dead backend can
-                       stall it indefinitely, so hand it to a detached thread; the moved
-                       shared_ptr keeps the AudioStreamer alive until it finishes.
-                       The catch is load-bearing, not style: we unwind into a C frame
-                       (switch_core_media_bug_close), so an escaping exception would
-                       std::terminate all of FreeSWITCH. See CLAUDE.md. */
-                    try {
-                        std::thread([s = std::move(streamer)]() mutable {
-                            s->disconnect();
-                        }).detach();
-                    } catch (const std::exception &e) {
-                        /* streamer died with the closure; no synchronous fallback -
-                           that would block teardown, which is what we are avoiding. */
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                          "(%s) stream_session_cleanup: could not spawn disconnect "
-                                          "thread (%s); closing without handshake\n", sessionId, e.what());
-                    } catch (...) {
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                          "(%s) stream_session_cleanup: could not spawn disconnect "
-                                          "thread; closing without handshake\n", sessionId);
-                    }
-                }
+                /* Never join the websocket thread while this session may be locked:
+                   an in-flight callback can itself be waiting to locate this session. */
+                streamer->disconnectAsync();
             }
 
             if (write_thread) {
