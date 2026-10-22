@@ -13,8 +13,18 @@ git submodule update
 
 export PKG_CONFIG_PATH=/usr/local/freeswitch/lib/pkgconfig
 
+# The module installs into the freeswitch.pc "modulesdir". Take it from the
+# installed FreeSWITCH pkgconfig, not from the distro's libfreeswitch-dev
+# (whose freeswitch.pc points at /usr/local/lib, the wrong place for
+# /usr/local/freeswitch installs).
+FS_MOD_DIR="$(pkg-config --variable=modulesdir freeswitch)"
+if [ ! -d "${FS_MOD_DIR}" ] || [ "${FS_MOD_DIR}" != "/usr/local/freeswitch/mod" ]; then
+  echo "ERROR: unexpected FreeSWITCH modules dir '${FS_MOD_DIR}' (pkg-config)" >&2
+  exit 1
+fi
+
 mkdir build
 cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake -DCMAKE_BUILD_TYPE=Release -DUSE_TLS=ON ..
 make
 make install
