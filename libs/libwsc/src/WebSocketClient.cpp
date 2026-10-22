@@ -251,7 +251,8 @@ void WebSocketClient::connect() {
 
     } catch (...) {
         // Failed to create or start context.
-        // Client remains disconnected; user may retry connect().
+        // Drop the context so that a later connect() is not blocked by it.
+        _ctx.reset();
     }
 }
 
@@ -273,4 +274,14 @@ void WebSocketClient::disconnectAsync() {
         ctx = std::move(_ctx);
     }
     if (ctx) ctx->stopAsync();
+}
+
+bool WebSocketClient::flush(int timeoutMs) {
+    if (!_ctx_mutex) return false;
+    std::shared_ptr<WebSocketContext> ctx;
+    {
+        std::lock_guard<std::mutex> lk(*_ctx_mutex);
+        ctx = _ctx;
+    }
+    return ctx && ctx->flushPending(timeoutMs);
 }

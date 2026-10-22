@@ -292,6 +292,11 @@ void WebSocketContext::run() {
 }
 
 void WebSocketContext::stop() {
+    /* Hand the queued application data over to the socket before the shutdown
+       is requested: once stop_requested is set the event thread stops flushing
+       the queue and the pending messages would be lost. */
+    flushPending(200);
+
     stop_requested.store(true, std::memory_order_release);
 
     requestWakeup();
@@ -308,10 +313,43 @@ void WebSocketContext::stop() {
 }
 
 void WebSocketContext::stopAsync() {
+    /* Hand the queued application data over to the socket before the shutdown
+       is requested: once stop_requested is set the event thread stops flushing
+       the queue and the pending messages would be lost. */
+    flushPending(200);
+
     stop_requested.store(true, std::memory_order_release);
     requestWakeup();
     if (event_thread.joinable()) {
         event_thread.detach();
+    }
+}
+
+bool WebSocketContext::flushPending(int timeoutMs) {
+    /* Already on the event thread: flush directly. */
+    if (std::this_thread::get_id() == event_tid) {
+        flushSendQueue();
+        return true;
+    }
+
+    /* Ask the event thread to write the queue to the socket and wait until it
+       did. The event thread handles the events one after the other, so the data
+       is in the socket buffer before anything that is queued afterwards (the
+       close frame for example). */
+    requestSendFlush();
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(send_queue_mutex);
+            if (send_queue.empty()) {
+                return true;
+            }
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 

@@ -9,7 +9,7 @@
 Utf8Validator::Utf8Validator()
         : expectedContinuation(0),
             seenE0(false), seenED(false),
-            seenF0(false), seenF4(false) {};
+            seenF0(false), seenF4(false) {}
 
 /**
  * \brief Validate a chunk of UTF-8 encoded data.

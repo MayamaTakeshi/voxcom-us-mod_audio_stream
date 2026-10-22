@@ -41,7 +41,9 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Got SWITCH_ABC_TYPE_CLOSE.\n");
         // Check if this is a normal channel closure or a requested closure
         channel_closing = switch_atomic_read(&tech_pvt->close_requested) ? 0 : 1;
-        stream_session_cleanup(session, NULL, channel_closing);
+        /* The bug must not be removed from here: FreeSWITCH holds the session
+           bug rwlock while it closes the bug, removing it would deadlock. */
+        stream_session_cleanup(session, NULL, channel_closing, 0);
     }
     break;
 
@@ -83,11 +85,9 @@ static switch_status_t start_capture(switch_core_session_t *session,
        SMBF_WRITE_REPLACE) rather than from the detatched write thread; the
        latter loses the codec_write_mutex trylock in switch_core_session_write_frame
        to the session/collect threads and its frames get silently dropped.
-       Stereo is excluded: its interleaved buffers do not match the decoded
-       frame granularity. */
-    if (!(flags & SMBF_STEREO)) {
-        flags |= SMBF_WRITE_REPLACE;
-    }
+       Works for every channel layout: the injected bytes are raw L16 at the
+       session rate and channel count, exactly what the frame carries. */
+    flags |= SMBF_WRITE_REPLACE;
 
     if (switch_channel_get_private(channel, MY_BUG_NAME))
     {
@@ -129,13 +129,13 @@ static switch_status_t start_capture(switch_core_session_t *session,
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "error initializing stream session write thread.\n");
         /* Bug is already attached; tear it down rather than leave a stream that can
            never play audio back. write_thread is NULL, so cleanup does not wait. */
-        stream_session_cleanup(session, NULL, 0);
+        stream_session_cleanup(session, NULL, 0, 1);
         return SWITCH_STATUS_FALSE;
     }
     if (SWITCH_STATUS_FALSE == stream_session_connect(pUserData))
     {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "error connecting stream session.\n");
-        stream_session_cleanup(session, NULL, 0);
+        stream_session_cleanup(session, NULL, 0, 1);
         return SWITCH_STATUS_FALSE;
     }
     return SWITCH_STATUS_SUCCESS;
@@ -153,7 +153,7 @@ static switch_status_t do_stop(switch_core_session_t *session, char *text)
     {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: stop\n");
     }
-    status = stream_session_cleanup(session, text, 0);
+    status = stream_session_cleanup(session, text, 0, 1);
 
     return status;
 }

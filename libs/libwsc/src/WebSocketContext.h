@@ -85,6 +85,11 @@ public:
     void stop();
     void stopAsync();
 
+    /* Hands the queued application data over to the socket. The queue is only
+       written by the event thread, so the request is posted there and awaited
+       (bounded). Returns false when the data could not be flushed in time. */
+    bool flushPending(int timeoutMs);
+
     // IWebSocketSinks overrides
     bool rxCompressionEnabled() const override;
     bool isConnected() const;

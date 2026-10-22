@@ -13,6 +13,9 @@ switch_status_t stream_session_write_thread_init(switch_core_session_t *session,
 switch_status_t stream_session_abort(void *pUserData);
 switch_bool_t stream_frame(switch_media_bug_t *bug);
 switch_bool_t stream_write_replace_frame(switch_media_bug_t *bug);
-switch_status_t stream_session_cleanup(switch_core_session_t *session, char *text, int channelIsClosing);
+/* removeBug must only be set by callers that are not running inside the bug's
+   own close callback: switch_core_media_bug_remove() takes the session bug
+   rwlock, which is already held when FreeSWITCH closes the bug itself. */
+switch_status_t stream_session_cleanup(switch_core_session_t *session, char *text, int channelIsClosing, int removeBug);
 
 #endif // AUDIO_STREAMER_GLUE_H

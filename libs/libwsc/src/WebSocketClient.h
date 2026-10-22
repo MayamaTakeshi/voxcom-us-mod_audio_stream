@@ -118,6 +118,18 @@ public:
     void disconnectAsync();
 
     /**
+     * \brief Flush the queued outgoing messages to the socket.
+     *
+     * The messages that were queued (for example the final text message) are
+     * handed over to the socket before the shutdown is requested. Otherwise
+     * they would be dropped.
+     *
+     * \param timeout Maximum time to wait for the queue to be flushed.
+     * \return true if the queue was flushed, false on timeout.
+     */
+    bool flush(int timeoutMs = 200);
+
+    /**
      * \brief Check whether the client is currently connected.
      *
      * \return true if the client is connected, false otherwise.

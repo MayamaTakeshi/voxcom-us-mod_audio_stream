@@ -44,6 +44,16 @@ struct private_data
        Session-pool allocated; reused synchronously inside the write loop. */
     uint8_t *inject_scratch;
     uint32_t inject_scratch_size;
+    /* Module owned frame handed back to FreeSWITCH with
+       switch_core_media_bug_set_write_replace_frame(). The frame owned by the
+       writer is never modified. Session-pool allocated. */
+    switch_frame_t *inject_frame;
+    /* Number of write-replace substitutions performed. A session that never
+       ticks has no external writer feeding the channel, so injected audio can
+       never be played out. */
+    volatile switch_atomic_t write_replace_ticks;
+    /* Time the websocket connection was established (epoch seconds). */
+    time_t connected_at;
     uint32_t write_frame_bytes;
     char initialMetadata[MAX_METADATA_LEN];
     switch_buffer_t *read_sbuffer;

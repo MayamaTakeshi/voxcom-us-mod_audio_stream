@@ -1,5 +1,6 @@
 #include <string>
 #include <cstring>
+#include <cctype>
 #include "mod_audio_stream.h"
 #include "WebSocketClient.h"
 #include <switch_json.h>
@@ -14,9 +15,22 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include "base64.h"
 
 #define FRAME_SIZE_8000  320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
+
+/* How long cleanup waits for websocket callbacks that are still running before
+   it gives up and keeps the session resources alive. */
+#define CALLBACK_GATE_TIMEOUT_MS (1000)
+
+/* A gap in the incoming audio larger than this starts a new burst. The tail of
+   the previous burst is padded to a whole frame at that point, so silence is
+   never inserted in the middle of a continuous stream. */
+#define AUDIO_BURST_GAP_MS (150)
+
+/* Maximum amount of not yet played audio kept in the write buffer (5s). */
+#define WRITE_BUFFER_MAX_FRAMES (250)
 
 class AudioStreamer {
 public:
@@ -77,6 +91,13 @@ public:
         client.sendMessage(text, strlen(text));
     }
 
+    /* Hands the queued messages over to the socket. The websocket layer keeps
+       them in a queue until its event thread picks them up, and that thread
+       stops flushing once the shutdown was requested. */
+    void flush() {
+        client.flush();
+    }
+
     void deleteFiles() {
         std::vector<std::string> files;
 
@@ -101,10 +122,21 @@ public:
         client.setOpenCallback({});
         client.setErrorCallback({});
         client.setCloseCallback({});
+        closeCallbackGate();
     }
 
     bool isCleanedUp() const {
         return m_cleanedUp.load(std::memory_order_acquire);
+    }
+
+    /* Waits for websocket callbacks that are still running. Returns false when
+       the wait timed out: the caller must then keep the session resources
+       alive, because a callback may still be using them. */
+    bool waitForCallbacks(int timeoutMs) {
+        std::unique_lock<std::mutex> lk(m_gateMutex);
+        if (m_inflightCallbacks == 0) return true;
+        return m_gateCv.wait_for(lk, std::chrono::milliseconds(timeoutMs),
+                                  [this] { return m_inflightCallbacks == 0; });
     }
 
 private:
@@ -186,64 +218,96 @@ private:
         client.setMessageCallback([wp](const std::string& message) {
             auto self = wp.lock();
             if (!self) return;
-            if (self->isCleanedUp()) return;
-            self->eventCallback(MESSAGE, message.c_str());
+            if (!self->enterCallback()) return;
+            if (!self->isCleanedUp()) {
+                self->eventCallback(MESSAGE, message.c_str());
+            }
+            self->leaveCallback();
         });
 
         client.setOpenCallback([wp]() {
             auto self = wp.lock();
             if (!self) return;
-            if (self->isCleanedUp()) return;
+            if (!self->enterCallback()) return;
+            if (!self->isCleanedUp()) {
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddStringToObject(root, "status", "connected");
+                char* json_str = cJSON_PrintUnformatted(root);
 
-            cJSON* root = cJSON_CreateObject();
-            cJSON_AddStringToObject(root, "status", "connected");
-            char* json_str = cJSON_PrintUnformatted(root);
+                self->eventCallback(CONNECT_SUCCESS, json_str);
 
-            self->eventCallback(CONNECT_SUCCESS, json_str);
-
-            cJSON_Delete(root);
-            switch_safe_free(json_str);
+                cJSON_Delete(root);
+                switch_safe_free(json_str);
+            }
+            self->leaveCallback();
         });
 
         client.setErrorCallback([wp](int code, const std::string& msg) {
             auto self = wp.lock();
             if (!self) return;
-            if (self->isCleanedUp()) return;
+            if (!self->enterCallback()) return;
+            if (!self->isCleanedUp()) {
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddStringToObject(root, "status", "error");
+                cJSON* message = cJSON_CreateObject();
+                cJSON_AddNumberToObject(message, "code", code);
+                cJSON_AddStringToObject(message, "error", msg.c_str());
+                cJSON_AddItemToObject(root, "message", message);
 
-            cJSON* root = cJSON_CreateObject();
-            cJSON_AddStringToObject(root, "status", "error");
-            cJSON* message = cJSON_CreateObject();
-            cJSON_AddNumberToObject(message, "code", code);
-            cJSON_AddStringToObject(message, "error", msg.c_str());
-            cJSON_AddItemToObject(root, "message", message);
+                char* json_str = cJSON_PrintUnformatted(root);
 
-            char* json_str = cJSON_PrintUnformatted(root);
+                self->eventCallback(CONNECT_ERROR, json_str);
 
-            self->eventCallback(CONNECT_ERROR, json_str);
-
-            cJSON_Delete(root);
-            switch_safe_free(json_str);
+                cJSON_Delete(root);
+                switch_safe_free(json_str);
+            }
+            self->leaveCallback();
         });
 
         client.setCloseCallback([wp](int code, const std::string& reason) {
             auto self = wp.lock();
             if (!self) return;
-            if (self->isCleanedUp()) return;
+            if (!self->enterCallback()) return;
+            if (!self->isCleanedUp()) {
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddStringToObject(root, "status", "disconnected");
+                cJSON* message = cJSON_CreateObject();
+                cJSON_AddNumberToObject(message, "code", code);
+                cJSON_AddStringToObject(message, "reason", reason.c_str());
+                cJSON_AddItemToObject(root, "message", message);
 
-            cJSON* root = cJSON_CreateObject();
-            cJSON_AddStringToObject(root, "status", "disconnected");
-            cJSON* message = cJSON_CreateObject();
-            cJSON_AddNumberToObject(message, "code", code);
-            cJSON_AddStringToObject(message, "reason", reason.c_str());
-            cJSON_AddItemToObject(root, "message", message);
+                char* json_str = cJSON_PrintUnformatted(root);
 
-            char* json_str = cJSON_PrintUnformatted(root);
+                self->eventCallback(CONNECTION_DROPPED, json_str);
 
-            self->eventCallback(CONNECTION_DROPPED, json_str);
-
-            cJSON_Delete(root);
-            switch_safe_free(json_str);
+                cJSON_Delete(root);
+                switch_safe_free(json_str);
+            }
+            self->leaveCallback();
         });
+    }
+
+    /* Callback gate. Cleanup closes the gate so no new callback starts and then
+       waits for the running ones to return before the session resources they
+       use are released. */
+    bool enterCallback() {
+        std::lock_guard<std::mutex> lk(m_gateMutex);
+        if (m_gateClosed) return false;
+        ++m_inflightCallbacks;
+        return true;
+    }
+
+    void leaveCallback() {
+        {
+            std::lock_guard<std::mutex> lk(m_gateMutex);
+            if (m_inflightCallbacks > 0) --m_inflightCallbacks;
+        }
+        m_gateCv.notify_all();
+    }
+
+    void closeCallbackGate() {
+        std::lock_guard<std::mutex> lk(m_gateMutex);
+        m_gateClosed = true;
     }
 
     static void* SWITCH_THREAD_FUNC close_media_bug_thread(switch_thread_t*, void* obj) {
@@ -252,7 +316,11 @@ private:
         auto* bug = channel
             ? static_cast<switch_media_bug_t*>(switch_channel_get_private(channel, MY_BUG_NAME))
             : nullptr;
-        if (bug) switch_core_media_bug_close(&bug, SWITCH_FALSE);
+        /* Remove (not just close) the bug so it does not stay attached to the
+           session. This must not run from inside the bug's own close callback:
+           switch_core_media_bug_remove() takes the session bug rwlock, which
+           FreeSWITCH already holds when it closes the bug itself. */
+        if (bug) switch_core_media_bug_remove(session, &bug);
         return nullptr;
     }
 
@@ -305,10 +373,8 @@ private:
 
     void injectRawAudio(switch_core_session_t *session, const std::vector<uint8_t>& rawAudio, int sampleRate) {
         auto *tech_pvt = m_techPvt;
-        switch_mutex_lock(tech_pvt->mutex);
         if (switch_atomic_read(&tech_pvt->close_requested) ||
-            switch_atomic_read(&tech_pvt->cleanup_started) || !tech_pvt->write_sbuffer) {
-            switch_mutex_unlock(tech_pvt->mutex);
+            switch_atomic_read(&tech_pvt->cleanup_started)) {
             return;
         }
 
@@ -317,7 +383,6 @@ private:
         const int inRate = sampleRate ? sampleRate : tech_pvt->wsSampling;
 
         if (rawAudio.empty() || channels <= 0) {
-            switch_mutex_unlock(tech_pvt->mutex);
             return;
         }
 
@@ -326,13 +391,11 @@ private:
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
                               "%s injectRawAudio: dropping malformed audio payload of %zu bytes\n",
                               tech_pvt->sessionId, rawAudio.size());
-            switch_mutex_unlock(tech_pvt->mutex);
             return;
         }
 
         spx_uint32_t in_frames = (spx_uint32_t)(rawAudio.size() / bytes_per_frame);
         if (in_frames == 0) {
-            switch_mutex_unlock(tech_pvt->mutex);
             return;
         }
 
@@ -344,13 +407,25 @@ private:
         spx_uint32_t in_len = in_frames;
         spx_uint32_t out_len = max_out;
 
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int64_t last = m_lastInjectMs.load(std::memory_order_acquire);
+        const bool newBurst = (last == 0) || (now - last > AUDIO_BURST_GAP_MS);
+
+        /* Resampling runs outside the session mutex: it only touches the
+           resampler, which is used by this thread alone. */
         SpeexResamplerState* resampler = tech_pvt->write_resampler;
         if (inRate != outRate && inRate != tech_pvt->wsSampling) {
             resampler = get_write_resampler(inRate, session);
             if (!resampler) {
-                switch_mutex_unlock(tech_pvt->mutex);
                 return;
             }
+        }
+
+        /* A new burst starts with silence, so the filter state of the
+           resampler must not carry over from the previous burst. */
+        if (newBurst && resampler) {
+            speex_resampler_reset_mem(resampler);
         }
 
         if (inRate == outRate || !resampler) {
@@ -367,29 +442,62 @@ private:
                                                     out_buf.data(), &out_len);
         }
         const size_t bytes_out = (size_t)out_len * (size_t)channels * sizeof(spx_int16_t);
+        if (!bytes_out) {
+            return;
+        }
+
+        const int64_t now2 = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int64_t last2 = m_lastInjectMs.load(std::memory_order_acquire);
+        const bool newBurst2 = (last2 == 0) || (now2 - last2 > AUDIO_BURST_GAP_MS);
 
         if (switch_mutex_lock(tech_pvt->write_mutex) != SWITCH_STATUS_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
                               "%s injectRawAudio: write mutex lock failed, dropping %zu bytes\n",
                               tech_pvt->sessionId, bytes_out);
-            switch_mutex_unlock(tech_pvt->mutex);
             return;
         }
 
-        const size_t free_space = switch_buffer_freespace(tech_pvt->write_sbuffer);
-        if (bytes_out > free_space) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-                              "%s injectRawAudio: write buffer has %zu bytes free, dropping %zu-byte audio message\n",
-                              tech_pvt->sessionId, free_space, bytes_out);
+        if (!tech_pvt->write_sbuffer) {
             switch_mutex_unlock(tech_pvt->write_mutex);
-            switch_mutex_unlock(tech_pvt->mutex);
             return;
+        }
+
+        /* The tail of the previous burst is only padded here, when a new burst
+           starts: padding on every control message would cut the audio of a
+           running utterance short. */
+        if (newBurst2) {
+            padWriteBuffer(session);
+        }
+
+        size_t free_space = switch_buffer_freespace(tech_pvt->write_sbuffer);
+        if (bytes_out > free_space) {
+            /* Keep the newest audio: drop the oldest queued audio to make
+               room instead of discarding the whole message. */
+            const size_t inuse = switch_buffer_inuse(tech_pvt->write_sbuffer);
+            const size_t excess = bytes_out - free_space;
+            if (excess < inuse) {
+                std::vector<uint8_t> discard(excess);
+                switch_buffer_read(tech_pvt->write_sbuffer, discard.data(), excess);
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                                  "%s injectRawAudio: write buffer full, dropped %zu bytes of queued audio\n",
+                                  tech_pvt->sessionId, excess);
+                free_space = switch_buffer_freespace(tech_pvt->write_sbuffer);
+            }
+            if (bytes_out > free_space) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                                  "%s injectRawAudio: write buffer has %zu bytes free, dropping %zu-byte audio message\n",
+                                  tech_pvt->sessionId, free_space, bytes_out);
+                switch_mutex_unlock(tech_pvt->write_mutex);
+                return;
+            }
         }
         switch_buffer_write(tech_pvt->write_sbuffer,
                             reinterpret_cast<const uint8_t*>(out_buf.data()), bytes_out);
 
         switch_mutex_unlock(tech_pvt->write_mutex);
-        switch_mutex_unlock(tech_pvt->mutex);
+
+        m_lastInjectMs.store(now2, std::memory_order_release);
     }
 
     void eventCallback(notifyEvent_t event, const char* message) {
@@ -453,7 +561,10 @@ private:
                     // Any non-audio message from the server means the old TTS
                     // response has ended; re-enable audio injection.
                     m_discardDeadlineMs.store(0, std::memory_order_release);
-                    pad_final_audio(psession);
+                    /* The partial frame left in the write buffer is padded
+                       when the next burst of audio arrives (or when the session
+                       is torn down) - padding here would cut a running
+                       utterance short. */
                     if (pr.ok == SWITCH_TRUE) {
                         m_notify(psession, EVENT_PLAY, msg.c_str());
                     } else {
@@ -607,33 +718,37 @@ private:
     }
 
 private:
-    void pad_final_audio(switch_core_session_t* session) {
+    /* Completes a partially filled frame in the write buffer with silence so
+       that the tail of an utterance is played out. Must be called with
+       tech_pvt->write_mutex held. */
+    void padWriteBuffer(switch_core_session_t* session) {
         auto* tech_pvt = m_techPvt;
-        switch_mutex_lock(tech_pvt->mutex);
-        if (switch_atomic_read(&tech_pvt->cleanup_started) ||
-            !tech_pvt->write_sbuffer || !tech_pvt->write_mutex) {
-            switch_mutex_unlock(tech_pvt->mutex);
+        if (!tech_pvt->write_sbuffer) {
             return;
         }
 
-        switch_mutex_lock(tech_pvt->write_mutex);
-        const size_t inuse = switch_buffer_inuse(tech_pvt->write_sbuffer);
         const size_t frame_bytes = tech_pvt->write_frame_bytes
             ? tech_pvt->write_frame_bytes
             : (size_t)tech_pvt->sampling * tech_pvt->channels * sizeof(spx_int16_t) / 50;
-        if (inuse && frame_bytes) {
-            const size_t remainder = inuse % frame_bytes;
-            const size_t padding = remainder ? frame_bytes - remainder : 0;
-            if (padding <= switch_buffer_freespace(tech_pvt->write_sbuffer)) {
-                std::vector<uint8_t> silence(padding, 0);
-                switch_buffer_write(tech_pvt->write_sbuffer, silence.data(), silence.size());
-            } else {
-                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-                                  "%s: cannot pad final raw audio frame\n", tech_pvt->sessionId);
-            }
+        if (!frame_bytes) {
+            return;
         }
-        switch_mutex_unlock(tech_pvt->write_mutex);
-        switch_mutex_unlock(tech_pvt->mutex);
+
+        const size_t inuse = switch_buffer_inuse(tech_pvt->write_sbuffer);
+        const size_t remainder = inuse % frame_bytes;
+        if (!remainder) {
+            return;
+        }
+
+        const size_t padding = frame_bytes - remainder;
+        if (padding > switch_buffer_freespace(tech_pvt->write_sbuffer)) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                              "%s: cannot pad final raw audio frame\n", tech_pvt->sessionId);
+            return;
+        }
+
+        std::vector<uint8_t> silence(padding, 0);
+        switch_buffer_write(tech_pvt->write_sbuffer, silence.data(), silence.size());
     }
 
     private_t* m_techPvt;
@@ -649,6 +764,13 @@ private:
     std::mutex m_stateMutex;
     // Barge-in: discard stale raw audio until a non-audio message or timeout.
     std::atomic<int64_t> m_discardDeadlineMs{0};
+    // Timestamp of the last injected raw audio, used to detect burst gaps.
+    std::atomic<int64_t> m_lastInjectMs{0};
+    // Callback gate.
+    std::mutex m_gateMutex;
+    std::condition_variable m_gateCv;
+    int m_inflightCallbacks{0};
+    bool m_gateClosed{false};
 };
 
 
@@ -799,9 +921,12 @@ namespace {
         const size_t read_buflen = (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * rtp_packets);
 
         /* write_sbuffer holds resampled audio at the session codec rate (sampling).
-           Size it to 2 seconds so burst audio from the server (e.g. pipecat binary
-           frames) is never dropped before stream_write_replace_frame drains it. */
-        const size_t write_buflen = (FRAME_SIZE_8000 * sampling / 8000 * channels * 100);
+           It is sized for 5 seconds so burst audio from the server (e.g. pipecat
+           binary frames) is never dropped before stream_write_replace_frame
+           drains it. It lives in the session pool, so it is released together
+           with the session. */
+        const size_t write_frame_bytes = (FRAME_SIZE_8000 * sampling / 8000 * channels);
+        const size_t write_buflen = write_frame_bytes * WRITE_BUFFER_MAX_FRAMES;
         
         switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, pool);
         switch_mutex_init(&tech_pvt->write_mutex, SWITCH_MUTEX_NESTED, pool);
@@ -848,6 +973,11 @@ namespace {
 
     void destroy_tech_pvt(private_t* tech_pvt) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "%s destroy_tech_pvt\n", tech_pvt->sessionId);
+
+        /* Lock order is always mutex -> write_mutex. */
+        switch_mutex_lock(tech_pvt->mutex);
+        switch_mutex_lock(tech_pvt->write_mutex);
+
         if (tech_pvt->read_resampler) {
             speex_resampler_destroy(tech_pvt->read_resampler);
             tech_pvt->read_resampler = nullptr;
@@ -855,6 +985,11 @@ namespace {
         if (tech_pvt->write_resampler) {
             speex_resampler_destroy(tech_pvt->write_resampler);
             tech_pvt->write_resampler = nullptr;
+        }
+        if (tech_pvt->pAudioStreamer) {
+            auto* sp_wrap = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
+            delete sp_wrap;
+            tech_pvt->pAudioStreamer = nullptr;
         }
         /* These session-pool mutexes remain valid until the session pool is
            reclaimed. Callers may already have obtained tech_pvt when cleanup
@@ -867,11 +1002,47 @@ namespace {
             switch_buffer_destroy(&tech_pvt->write_sbuffer);
             tech_pvt->write_sbuffer = nullptr;
         }
+
+        switch_mutex_unlock(tech_pvt->write_mutex);
+        switch_mutex_unlock(tech_pvt->mutex);
     }
 
 }
 
 extern "C" {
+    /* True when the frame carries raw 16 bit linear PCM ("L16") at the session
+       rate, so that raw L16 bytes may replace its payload. The frame reaching
+       the write-replace hook is the codec input (decoded PCM), not the wire
+       codec, so it is identified by its IANA name rather than by comparing it
+       against the session read/write codec. */
+    static switch_bool_t frame_is_session_pcm(switch_core_session_t *session, switch_frame_t *frame,
+                                              int expected_rate, int expected_channels) {
+        (void)session;
+        if (!frame || !frame->codec || !frame->codec->implementation) {
+            return SWITCH_FALSE;
+        }
+        const switch_codec_implementation_t *impl = frame->codec->implementation;
+        if (!impl->iananame || strcasecmp(impl->iananame, "L16") != 0) {
+            return SWITCH_FALSE;
+        }
+        if (impl->samples_per_packet == 0) {
+            return SWITCH_FALSE;
+        }
+        if ((impl->decoded_bytes_per_packet / impl->samples_per_packet) != 2) {
+            return SWITCH_FALSE;
+        }
+        if (impl->number_of_channels == 0) {
+            return SWITCH_FALSE;
+        }
+        if (expected_rate > 0 && (int)impl->samples_per_second != expected_rate) {
+            return SWITCH_FALSE;
+        }
+        if (expected_channels > 0 && (int)impl->number_of_channels != expected_channels) {
+            return SWITCH_FALSE;
+        }
+        return SWITCH_TRUE;
+    }
+
     int validate_ws_uri(const char* url, char* wsUri) {
         if (!url || !wsUri) {
             return 0;
@@ -934,6 +1105,18 @@ extern "C" {
                 port = port * 10 + digit;
             }
             if (port == 0) return 0;
+        }
+
+        /* The path and the query end up in the handshake request line, so they
+           must not contain characters that are not allowed in a request
+           target: no spaces, no control characters and no non ASCII bytes.
+           A fragment is not sent to the server at all, so it is rejected. */
+        {
+            const char* path = authorityEnd;
+            for (const unsigned char* p = reinterpret_cast<const unsigned char*>(path); *p; ++p) {
+                if (*p <= 0x20 || *p >= 0x7f) return 0;
+            }
+            if (strchr(path, '#')) return 0;
         }
 
         // Copy valid URI to wsUri
@@ -1155,13 +1338,19 @@ extern "C" {
             return SWITCH_STATUS_FALSE;
         }
 
-        /* Mono/mixed: deliver injected audio through the session's write loop
-           (SMBF_WRITE_REPLACE hook set in start_capture), never via the
-           write thread. Stereo falls back to the write thread path. */
-        if (channels == 1) {
-            switch_atomic_set(&tech_pvt->use_write_replace, 1);
-            tech_pvt->inject_scratch = (uint8_t *)switch_core_session_alloc(session, SWITCH_RECOMMENDED_BUFFER_SIZE);
-            tech_pvt->inject_scratch_size = SWITCH_RECOMMENDED_BUFFER_SIZE;
+        /* Inject outgoing audio inside the session's own write loop (via
+           SMBF_WRITE_REPLACE) for every channel layout: the detached write
+           thread loses the codec_write_mutex trylock in
+           switch_core_session_write_frame to the session/collect threads and
+           its frames get silently dropped. */
+        switch_atomic_set(&tech_pvt->use_write_replace, 1);
+        tech_pvt->inject_scratch = (uint8_t *)switch_core_session_alloc(session, SWITCH_RECOMMENDED_BUFFER_SIZE);
+        tech_pvt->inject_scratch_size = SWITCH_RECOMMENDED_BUFFER_SIZE;
+        tech_pvt->inject_frame = (switch_frame_t *)switch_core_session_alloc(session, sizeof(switch_frame_t));
+        if (tech_pvt->inject_frame) {
+            memset(tech_pvt->inject_frame, 0, sizeof(switch_frame_t));
+            tech_pvt->inject_frame->data = tech_pvt->inject_scratch;
+            tech_pvt->inject_frame->buflen = tech_pvt->inject_scratch_size;
         }
 
         *ppUserData = tech_pvt;
@@ -1218,9 +1407,10 @@ extern "C" {
         std::shared_ptr<AudioStreamer> streamer;
         std::vector<std::vector<uint8_t>> pending_send;
 
-        if (switch_mutex_trylock(tech_pvt->mutex) != SWITCH_STATUS_SUCCESS) {
-            return SWITCH_TRUE;
-        }
+        /* Take the state under the lock but do the reading and the resampling
+           without it: the write-replace callback shares this mutex and runs in
+           the session's write loop, it must not be stalled by the read path. */
+        switch_mutex_lock(tech_pvt->mutex);
 
         if (!tech_pvt->pAudioStreamer) {
             switch_mutex_unlock(tech_pvt->mutex);
@@ -1235,14 +1425,18 @@ extern "C" {
 
         streamer = *sp_ptr;
 
-        auto *resampler = tech_pvt->read_resampler;
         const int channels = tech_pvt->channels;
         const int rtp_packets = tech_pvt->rtp_packets;
-        const size_t target_bytes = (size_t)FRAME_SIZE_8000 * tech_pvt->wsSampling /
+        const int wsSampling = tech_pvt->wsSampling;
+        const int sampling = tech_pvt->sampling;
+        const size_t target_bytes = (size_t)FRAME_SIZE_8000 * wsSampling /
                                     8000 * channels * rtp_packets;
 
+        switch_mutex_unlock(tech_pvt->mutex);
+
         auto append_audio = [&](const uint8_t* data, size_t length) {
-            while (length > 0) {
+            switch_mutex_lock(tech_pvt->mutex);
+            while (length > 0 && tech_pvt->read_sbuffer) {
                 const size_t free_space = switch_buffer_freespace(tech_pvt->read_sbuffer);
                 if (free_space == 0) break;
 
@@ -1258,7 +1452,14 @@ extern "C" {
                     pending_send.emplace_back(std::move(chunk));
                 }
             }
+            switch_mutex_unlock(tech_pvt->mutex);
         };
+
+        /* The resampler is owned by the session and released by the cleanup, so
+           it is only used while the lock is held. */
+        switch_mutex_lock(tech_pvt->mutex);
+        auto *resampler = tech_pvt->read_resampler;
+        switch_mutex_unlock(tech_pvt->mutex);
 
         if (nullptr == resampler) {
             
@@ -1291,11 +1492,18 @@ extern "C" {
                     continue;
                 }
 
+                switch_mutex_lock(tech_pvt->mutex);
+                resampler = tech_pvt->read_resampler;
+                if (!resampler) {
+                    switch_mutex_unlock(tech_pvt->mutex);
+                    break;
+                }
+
                 spx_uint32_t in_len = frame.samples
                     ? frame.samples
                     : (spx_uint32_t)(frame.datalen / channels / sizeof(spx_int16_t));
-                const size_t estimated = (size_t)in_len * tech_pvt->wsSampling /
-                                         tech_pvt->sampling + 128;
+                const size_t estimated = (size_t)in_len * wsSampling /
+                                         sampling + 128;
                 spx_uint32_t out_len = (spx_uint32_t)estimated;
 
                 std::vector<spx_int16_t> out;
@@ -1315,6 +1523,7 @@ extern "C" {
                                     out.data(),
                                     &out_len);
                 }
+                switch_mutex_unlock(tech_pvt->mutex);
 
                 if(out_len > 0) {
                     const size_t bytes_written = (size_t)out_len * (size_t)channels * sizeof(spx_int16_t);
@@ -1328,8 +1537,6 @@ extern "C" {
                 }
             }
         }
-        
-        switch_mutex_unlock(tech_pvt->mutex);
     
         if (!streamer || !streamer->isConnected()) return SWITCH_TRUE;
 
@@ -1344,44 +1551,64 @@ extern "C" {
 
     switch_bool_t stream_write_replace_frame(switch_media_bug_t *bug) {
         auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
-        if (!tech_pvt || switch_mutex_trylock(tech_pvt->mutex) != SWITCH_STATUS_SUCCESS) {
+        if (!tech_pvt) return SWITCH_TRUE;
+        if (switch_mutex_trylock(tech_pvt->mutex) != SWITCH_STATUS_SUCCESS) {
             return SWITCH_TRUE;
         }
         if (switch_atomic_read(&tech_pvt->close_requested) ||
-            switch_atomic_read(&tech_pvt->cleanup_started) || !tech_pvt->write_sbuffer) {
+            switch_atomic_read(&tech_pvt->cleanup_started) || !tech_pvt->write_sbuffer ||
+            !tech_pvt->inject_frame || !tech_pvt->inject_scratch) {
             switch_mutex_unlock(tech_pvt->mutex);
             return SWITCH_TRUE;
         }
 
-        switch_frame_t *frame = switch_core_media_bug_get_write_replace_frame(bug);
-        if (!frame || !frame->datalen) {
+        switch_frame_t *caller_frame = switch_core_media_bug_get_write_replace_frame(bug);
+        if (!caller_frame || !caller_frame->datalen || !caller_frame->codec ||
+            !caller_frame->codec->implementation) {
             switch_mutex_unlock(tech_pvt->mutex);
             return SWITCH_TRUE;
         }
 
-        const size_t bytes = frame->datalen;
-        tech_pvt->write_frame_bytes = (uint32_t)bytes;
-        if (!tech_pvt->inject_scratch || tech_pvt->inject_scratch_size < bytes) {
+        /* The injected bytes are raw L16 at the session rate and channel count:
+           only such frames may be replaced, anything else would be encoded as
+           noise. */
+        switch_core_session_t *session = switch_core_media_bug_get_session(bug);
+        if (frame_is_session_pcm(session, caller_frame, tech_pvt->sampling, tech_pvt->channels) == SWITCH_FALSE) {
+            switch_mutex_unlock(tech_pvt->mutex);
+            return SWITCH_TRUE;
+        }
+
+        const size_t bytes = caller_frame->datalen;
+        if (tech_pvt->inject_scratch_size < bytes) {
             switch_mutex_unlock(tech_pvt->mutex);
             return SWITCH_TRUE;
         }
 
         size_t consumed = 0;
-        if (switch_mutex_trylock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS) {
-            if (switch_buffer_inuse(tech_pvt->write_sbuffer) >= bytes) {
-                consumed = switch_buffer_read(tech_pvt->write_sbuffer, tech_pvt->inject_scratch, bytes);
-            }
-            switch_mutex_unlock(tech_pvt->write_mutex);
+        switch_mutex_lock(tech_pvt->write_mutex);
+        if (switch_buffer_inuse(tech_pvt->write_sbuffer) >= bytes) {
+            consumed = switch_buffer_read(tech_pvt->write_sbuffer, tech_pvt->inject_scratch, bytes);
         }
-        switch_mutex_unlock(tech_pvt->mutex);
+        switch_mutex_unlock(tech_pvt->write_mutex);
 
         if (consumed == bytes) {
-            /* Substitute only the data; keep the frame's codec/size so the
-               write-bug loop still hits the perfect-encode path. */
-            frame->data = tech_pvt->inject_scratch;
-            frame->datalen = (uint32_t)bytes;
+            /* Hand back a module owned frame. The frame owned by the writer is
+               never modified, FreeSWITCH picks up write_replace_frame_out after
+               the callback returned. */
+            switch_frame_t *frame = tech_pvt->inject_frame;
+            frame->codec = caller_frame->codec;
+            frame->channels = caller_frame->channels;
+            frame->rate = caller_frame->rate;
             frame->samples = (uint32_t)(bytes / 2 / tech_pvt->channels);
+            frame->datalen = (uint32_t)bytes;
+            frame->data = tech_pvt->inject_scratch;
+            frame->buflen = tech_pvt->inject_scratch_size;
+            switch_core_media_bug_set_write_replace_frame(bug, frame);
+            tech_pvt->write_frame_bytes = (uint32_t)bytes;
+            switch_atomic_inc(&tech_pvt->write_replace_ticks);
         }
+
+        switch_mutex_unlock(tech_pvt->mutex);
 
         return SWITCH_TRUE;
     }
@@ -1423,11 +1650,12 @@ extern "C" {
         }
         switch_mutex_unlock(tech_pvt->mutex);
         if (!streamer) return SWITCH_STATUS_FALSE;
+        tech_pvt->connected_at = time(NULL);
         streamer->connect();
         return SWITCH_STATUS_SUCCESS;
     }
 
-    switch_status_t stream_session_cleanup(switch_core_session_t *session, char* text, int channelIsClosing) {
+    switch_status_t stream_session_cleanup(switch_core_session_t *session, char* text, int channelIsClosing, int removeBug) {
         switch_channel_t *channel = switch_core_session_get_channel(session);
         auto *bug = (switch_media_bug_t*) switch_channel_get_private(channel, MY_BUG_NAME);
         if(bug)
@@ -1440,6 +1668,8 @@ extern "C" {
             std::shared_ptr<AudioStreamer> streamer;
             switch_thread_t *write_thread = nullptr;
             int write_thread_exited = 1; /* no thread to wait for -> full cleanup */
+            int callbacks_finished = 1;   /* no callback running -> resources can go */
+            switch_media_bug_t *bug_to_remove = nullptr;
 
             switch_mutex_lock(tech_pvt->mutex);
 
@@ -1451,6 +1681,12 @@ extern "C" {
             switch_atomic_set(&tech_pvt->close_requested, 1);
 
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_session_cleanup\n", sessionId);
+
+            /* The bug is removed by the caller of this function only when it is
+               not running inside the bug's own close callback: removing a bug
+               takes the session bug rwlock, which FreeSWITCH already holds
+               while it closes the bug itself. */
+            bug_to_remove = removeBug ? bug : nullptr;
 
             switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
 
@@ -1466,13 +1702,9 @@ extern "C" {
 
             switch_mutex_unlock(tech_pvt->mutex);
 
-            if (!channelIsClosing) {
-                switch_core_media_bug_remove(session, &bug);
-            }
-
-            if (sp_wrap) {
-                delete sp_wrap;
-                sp_wrap = nullptr;
+            /* The bug must be gone before the buffers it works on are released. */
+            if (bug_to_remove) {
+                switch_core_media_bug_remove(session, &bug_to_remove);
             }
 
             if(streamer) {
@@ -1482,9 +1714,29 @@ extern "C" {
                    context after this point. */
                 streamer->markCleanedUp();
 
+                /* Hand the queued messages (the final text above) over to the
+                   socket before the connection goes away. */
+                streamer->flush();
+
                 /* Never join the websocket thread while this session may be locked:
                    an in-flight callback can itself be waiting to locate this session. */
                 streamer->disconnectAsync();
+
+                /* Wait for the callbacks that are still running: they use the
+                   session resources that are released below. */
+                callbacks_finished = streamer->waitForCallbacks(CALLBACK_GATE_TIMEOUT_MS);
+                if (!callbacks_finished) {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                                      "(%s) stream_session_cleanup: websocket callback did not finish within %d ms\n",
+                                      sessionId, CALLBACK_GATE_TIMEOUT_MS);
+                }
+            }
+
+            /* The streamer (and with it the resamplers) may only be released
+               once no callback is running any more. */
+            if (sp_wrap) {
+                delete sp_wrap;
+                sp_wrap = nullptr;
             }
 
             if (write_thread) {
@@ -1519,13 +1771,14 @@ extern "C" {
                 }
             }
 
-            if (!channelIsClosing && write_thread_exited) {
+            if (!channelIsClosing && write_thread_exited && callbacks_finished) {
                 destroy_tech_pvt(tech_pvt);
             } else {
-                /* Write thread may still be live (hangup path, or the wait timed out).
-                   Leave write_mutex/write_sbuffer to the session pool, but the speex
-                   resamplers are malloc'd - the pool never reclaims them, and the write
-                   thread never touches them, so free them here. */
+                /* Write thread or websocket callback may still be live (hangup
+                   path, or the wait timed out). Leave write_mutex/write_sbuffer to
+                   the session pool, but the speex resamplers are malloc'd - the
+                   pool never reclaims them, and the write thread never touches
+                   them, so free them here. */
                 if (tech_pvt->read_resampler) {
                     speex_resampler_destroy(tech_pvt->read_resampler);
                     tech_pvt->read_resampler = nullptr;
@@ -1534,6 +1787,17 @@ extern "C" {
                     speex_resampler_destroy(tech_pvt->write_resampler);
                     tech_pvt->write_resampler = nullptr;
                 }
+            }
+
+            /* No write-replace tick means that nothing ever wrote a frame to
+               the session, so no injected audio could be played out. */
+            if (switch_atomic_read(&tech_pvt->use_write_replace) &&
+                switch_atomic_read(&tech_pvt->write_replace_ticks) == 0 &&
+                tech_pvt->connected_at && (time(NULL) - tech_pvt->connected_at) >= 3) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                                  "(%s) no write-replace tick was received: the dialplan does not write audio to "
+                                  "this channel, injected audio cannot be played out (set send_silence_when_idle)\n",
+                                  sessionId);
             }
 
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%s) stream_session_cleanup: connection closed\n", sessionId);
