@@ -247,6 +247,23 @@ There is an error with the connection. Multiple fields will be available on the 
 | 10   | `TIMEOUT`             | Timeout                                              |
 | 11   | `PROTOCOL`            | WebSocket protocol error                             |
 
+### Binary PCM playback
+
+The WebSocket server can send raw audio as binary messages. Audio must be signed
+16-bit little-endian PCM, without a WAV header, at the sample rate and channel
+count selected by `uuid_audio_stream ... start`. For `mono 16k`, send one channel
+at 16000 Hz; a 20 ms packet contains 640 bytes. The module resamples it to the
+call's codec rate using the same playback path as legacy raw `streamAudio`.
+Message boundaries need not align with 20 ms packets, but each message must
+contain complete samples for every channel. Empty messages are ignored and
+misaligned payloads are dropped with a warning.
+
+Caller audio is already sent upstream as binary PCM, so this allows binary PCM
+in both directions without base64 or JSON audio envelopes. Text messages remain
+available for control/intent JSON. Existing JSON `streamAudio` remains supported,
+including its explicit sample rate for servers generating audio at another rate.
+Binary playback generates no `mod_audio_stream::json` or `play` event.
+
 ### Server-side playback interruption
 
 For raw PCM playback, the WebSocket server can send a text frame:
@@ -255,8 +272,8 @@ For raw PCM playback, the WebSocket server can send a text frame:
 {"type":"clearAudio"}
 ```
 
-This clears decoded audio queued by earlier `streamAudio` messages. It is handled
-directly by the module and does not emit a `mod_audio_stream::json` or `play`
+This clears decoded audio queued by earlier binary PCM or `streamAudio` messages.
+It is handled directly by the module and does not emit a `mod_audio_stream::json` or `play`
 event. The next audio message is accepted immediately, including when it follows
 the clear on the same connection without a pause. Repeated clears are safe.
 The next audio burst resets its resampler history to avoid leaking the previous

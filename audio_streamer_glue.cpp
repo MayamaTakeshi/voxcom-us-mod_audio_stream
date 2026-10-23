@@ -119,6 +119,7 @@ public:
     void markCleanedUp() {
         m_cleanedUp.store(true, std::memory_order_release);
         client.setMessageCallback({});
+        client.setBinaryCallback({});
         client.setOpenCallback({});
         client.setErrorCallback({});
         client.setCloseCallback({});
@@ -222,6 +223,23 @@ private:
             if (!self->enterCallback()) return;
             if (!self->isCleanedUp()) {
                 self->eventCallback(MESSAGE, message.c_str());
+            }
+            self->leaveCallback();
+        });
+
+        client.setBinaryCallback([wp](const void* data, size_t len) {
+            auto self = wp.lock();
+            if (!self) return;
+            if (!self->enterCallback()) return;
+            if (!self->isCleanedUp()) {
+                auto* session = switch_core_session_locate(self->m_sessionId.c_str());
+                if (session) {
+                    // Binary audio has no format header: use the rate/channels
+                    // negotiated by uuid_audio_stream start, including NUL bytes.
+                    self->receiveRawAudio(session, static_cast<const uint8_t*>(data),
+                                          len, self->m_techPvt->wsSampling);
+                    switch_core_session_rwunlock(session);
+                }
             }
             self->leaveCallback();
         });
@@ -373,7 +391,8 @@ private:
     }
 
     void clearPlaybackAudio() {
-        // Called on the websocket receive thread, in order with streamAudio.
+        // Called on the websocket receive thread, in order with binary audio
+        // and legacy streamAudio messages.
         // Unlike API flush, do not discard subsequent audio for a time window:
         // frames after clearAudio can already belong to the next response.
         auto *tech_pvt = m_techPvt;
@@ -392,7 +411,22 @@ private:
         switch_mutex_unlock(tech_pvt->mutex);
     }
 
-    void injectRawAudio(switch_core_session_t *session, const std::vector<uint8_t>& rawAudio, int sampleRate) {
+    void receiveRawAudio(switch_core_session_t *session, const uint8_t* audio,
+                         size_t len, int sampleRate) {
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (m_discardDeadlineMs.load(std::memory_order_acquire) > now) {
+            return; // API flush also suppresses binary in-flight audio.
+        }
+        m_discardDeadlineMs.store(0, std::memory_order_release);
+        switch_channel_t *channel = switch_core_session_get_channel(session);
+        if (channel && switch_channel_ready(channel)) {
+            injectRawAudio(session, audio, len, sampleRate);
+        }
+    }
+
+    void injectRawAudio(switch_core_session_t *session, const uint8_t* rawAudio,
+                        size_t rawAudioSize, int sampleRate) {
         auto *tech_pvt = m_techPvt;
         if (switch_atomic_read(&tech_pvt->close_requested) ||
             switch_atomic_read(&tech_pvt->cleanup_started)) {
@@ -403,19 +437,19 @@ private:
         const int channels = tech_pvt->channels;
         const int inRate = sampleRate ? sampleRate : tech_pvt->wsSampling;
 
-        if (rawAudio.empty() || channels <= 0) {
+        if (!rawAudio || !rawAudioSize || channels <= 0) {
             return;
         }
 
         const size_t bytes_per_frame = sizeof(spx_int16_t) * (size_t)channels;
-        if (rawAudio.size() % bytes_per_frame != 0) {
+        if (rawAudioSize % bytes_per_frame != 0) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
                               "%s injectRawAudio: dropping malformed audio payload of %zu bytes\n",
-                              tech_pvt->sessionId, rawAudio.size());
+                              tech_pvt->sessionId, rawAudioSize);
             return;
         }
 
-        spx_uint32_t in_frames = (spx_uint32_t)(rawAudio.size() / bytes_per_frame);
+        spx_uint32_t in_frames = (spx_uint32_t)(rawAudioSize / bytes_per_frame);
         if (in_frames == 0) {
             return;
         }
@@ -423,7 +457,7 @@ private:
         spx_uint32_t max_out = (spx_uint32_t)((double)in_frames * outRate / inRate) + 128;
         std::vector<spx_int16_t> in_buf(in_frames * channels);
         std::vector<spx_int16_t> out_buf(max_out * channels);
-        std::memcpy(in_buf.data(), rawAudio.data(), rawAudio.size());
+        std::memcpy(in_buf.data(), rawAudio, rawAudioSize);
 
         spx_uint32_t in_len = in_frames;
         spx_uint32_t out_len = max_out;
@@ -566,22 +600,7 @@ private:
                     // This is a media control message, not an IVR intent/event.
                     break;
                 } else if (pr.isRawAudio) {
-                    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count();
-                    const auto discard_deadline = m_discardDeadlineMs.load(std::memory_order_acquire);
-                    if (discard_deadline > now) {
-                        // Barge-in flush active: silently drop audio that
-                        // belonged to the interrupted response.
-                        break;
-                    }
-                    m_discardDeadlineMs.store(0, std::memory_order_release);
-                    /* Don't inject into a dying channel - nothing drains it. */
-                    {
-                        switch_channel_t *ch = switch_core_session_get_channel(psession);
-                        if (ch && switch_channel_ready(ch)) {
-                            injectRawAudio(psession, pr.rawAudio, pr.sampleRate);
-                        }
-                    }
+                    receiveRawAudio(psession, pr.rawAudio.data(), pr.rawAudio.size(), pr.sampleRate);
                 } else {
                     // Any non-audio message from the server means the old TTS
                     // response has ended; re-enable audio injection.
