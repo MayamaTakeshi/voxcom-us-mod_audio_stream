@@ -247,6 +247,32 @@ There is an error with the connection. Multiple fields will be available on the 
 | 10   | `TIMEOUT`             | Timeout                                              |
 | 11   | `PROTOCOL`            | WebSocket protocol error                             |
 
+### Server-side playback interruption
+
+For raw PCM playback, the WebSocket server can send a text frame:
+
+```json
+{"type":"clearAudio"}
+```
+
+This clears decoded audio queued by earlier `streamAudio` messages. It is handled
+directly by the module and does not emit a `mod_audio_stream::json` or `play`
+event. The next audio message is accepted immediately, including when it follows
+the clear on the same connection without a pause. Repeated clears are safe.
+The next audio burst resets its resampler history to avoid leaking the previous
+response's filter tail.
+
+The server must stop sending the interrupted response before sending `clearAudio`.
+Messages on the same WebSocket are ordered: old audio arriving before the clear
+is discarded from the playback queue, and audio after it belongs to the next
+response. This differs from `uuid_audio_stream <uuid> flush`, which also discards
+incoming audio temporarily. Do not use the API's suppression window for an
+ordered server-side clear, as it can discard the start of the next response.
+
+Audio already handed to FreeSWITCH/RTP or buffered in the caller's device cannot
+be recalled. This operation clears the module's raw PCM queue; it does not stop
+file playback triggered by the `play` event.
+
 ### play
 
 **Name**: mod_audio_stream::play

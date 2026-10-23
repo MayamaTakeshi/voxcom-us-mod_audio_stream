@@ -206,6 +206,7 @@ private:
         std::string rewrittenJsonData;
         std::vector<std::string> errors;
         bool isRawAudio = false;
+        bool isClearAudio = false;
         int sampleRate = 0;
         std::vector<uint8_t> rawAudio;
     };
@@ -369,6 +370,26 @@ private:
         }
         m_writeResamplers.emplace(input_rate, resampler);
         return resampler;
+    }
+
+    void clearPlaybackAudio() {
+        // Called on the websocket receive thread, in order with streamAudio.
+        // Unlike API flush, do not discard subsequent audio for a time window:
+        // frames after clearAudio can already belong to the next response.
+        auto *tech_pvt = m_techPvt;
+        switch_mutex_lock(tech_pvt->mutex);
+        if (!switch_atomic_read(&tech_pvt->cleanup_started) &&
+            !switch_atomic_read(&tech_pvt->close_requested)) {
+            switch_mutex_lock(tech_pvt->write_mutex);
+            if (tech_pvt->write_sbuffer) {
+                switch_buffer_zero(tech_pvt->write_sbuffer);
+            }
+            switch_mutex_unlock(tech_pvt->write_mutex);
+            // The next audio starts a new burst and resets its resampler state.
+            m_lastInjectMs.store(0, std::memory_order_release);
+            m_discardDeadlineMs.store(0, std::memory_order_release);
+        }
+        switch_mutex_unlock(tech_pvt->mutex);
     }
 
     void injectRawAudio(switch_core_session_t *session, const std::vector<uint8_t>& rawAudio, int sampleRate) {
@@ -540,7 +561,11 @@ private:
                 break;
 
             case MESSAGE:
-                if (pr.isRawAudio) {
+                if (pr.isClearAudio) {
+                    clearPlaybackAudio();
+                    // This is a media control message, not an IVR intent/event.
+                    break;
+                } else if (pr.isRawAudio) {
                     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now().time_since_epoch()).count();
                     const auto discard_deadline = m_discardDeadlineMs.load(std::memory_order_acquire);
@@ -595,6 +620,10 @@ private:
         if (!root) return out;
 
         const char* jsonType = cJSON_GetObjectCstr(root.get(), "type");
+        if (jsonType && std::strcmp(jsonType, "clearAudio") == 0) {
+            out.isClearAudio = true;
+            return out;
+        }
         if (!jsonType || std::strcmp(jsonType, "streamAudio") != 0) {
             return out; // not ours
         }
