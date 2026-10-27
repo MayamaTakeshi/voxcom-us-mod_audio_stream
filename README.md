@@ -100,6 +100,27 @@ Can be `NONE` which result in no peer verification.
   - `STREAM_TLS_DISABLE_HOSTNAME_VALIDATION` if `true`, disables the check of the hostname against the peer server certificate.
 Defaults to `false`, which enforces hostname match with the peer certificate.
 
+## Outgoing buffering
+
+Each connection limits pending application payloads to 1 MiB (including the
+batch being serialized), and the libevent output buffer to 1 MiB including
+WebSocket framing. The pending queue also retains its 1024-entry limit. A single
+payload must fit these limits; the output check reserves up to 14 header bytes.
+Checks apply to text, binary audio and control frames, before payload copying or
+compression where possible, and again after compression to account for expansion.
+These are payload/wire-buffer limits, not a total process-memory limit: socket
+buffers, TLS, compression and serialization scratch space have their own overhead.
+
+If either queue fills, libwsc rejects further sends and aborts the connection. The
+module reports `mod_audio_stream::error` with code `1` (`IO`) and message
+`Outgoing WebSocket buffer limit exceeded (1 MiB); peer is not keeping up`.
+The existing error path removes the audio stream. libwsc does not automatically
+reconnect. This prevents a slow or stalled peer from retaining unlimited caller
+audio. It also makes overload visible instead of silently dropping arbitrary
+pieces of audio or metadata. Successful enqueueing does not confirm delivery.
+
+For isolated ws/wss backpressure regression tests, see [tests/README.md](tests/README.md).
+
 ## API
 
 ### Commands

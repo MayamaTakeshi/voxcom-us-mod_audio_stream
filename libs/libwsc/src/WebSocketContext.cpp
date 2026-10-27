@@ -275,6 +275,11 @@ void WebSocketContext::run() {
 
     bufferevent_enable(_bev, EV_READ | EV_WRITE);
 
+    if (checkSendOverflow()) {
+        cleanup();
+        return;
+    }
+
     if (bufferevent_socket_connect_hostname(_bev, dns_base, AF_UNSPEC, _cfg.host.c_str(), _cfg.port) < 0) {
         log_error("Failed to start connection");
         sendError(ErrorCode::CONNECT_FAILED, "Failed to start connection");
@@ -558,6 +563,7 @@ void WebSocketContext::handleEvent(bufferevent* bev, short events) {
             if (!ws_open) {
                 std::lock_guard<std::mutex> lk(send_queue_mutex);
                 send_queue.clear();
+                send_queue_bytes = 0;
             }
 
             if (ws_open && st == ConnectionState::DISCONNECTING) {
@@ -580,6 +586,7 @@ void WebSocketContext::handleEvent(bufferevent* bev, short events) {
                 {
                     std::lock_guard<std::mutex> lk(send_queue_mutex);
                     send_queue.clear();
+                    send_queue_bytes = 0;
                 }
 
             } else {
@@ -603,6 +610,7 @@ void WebSocketContext::handleEvent(bufferevent* bev, short events) {
                 {
                     std::lock_guard<std::mutex> lk(send_queue_mutex);
                     send_queue.clear();
+                    send_queue_bytes = 0;
                 }
 
             } else if (!graceful) {
@@ -802,16 +810,29 @@ void WebSocketContext::handleRead(bufferevent* bev) {
 }
 
 void WebSocketContext::flushSendQueue() {
+    if (checkSendOverflow()) return;
     std::deque<Pending> local;
     {
         std::lock_guard<std::mutex> lk(send_queue_mutex);
         local.swap(send_queue);
     }
 
+    size_t batch_bytes = 0;
+    for (const auto& p : local) batch_bytes += p.type == Pending::Text ? p.text.size() : p.bin.size();
+    struct BatchAccounting {
+        WebSocketContext* self;
+        size_t bytes;
+        ~BatchAccounting() {
+            std::lock_guard<std::mutex> lk(self->send_queue_mutex);
+            self->send_queue_bytes -= bytes;
+        }
+    } accounting{this, batch_bytes};
+
     const auto st = connection_state.load(std::memory_order_acquire);
     const bool can_send_app = (st == ConnectionState::CONNECTED);
 
     for (auto& p : local) {
+        if (checkSendOverflow()) return;
 
         if (p.type == Pending::Text) {
             if (!can_send_app) continue;
@@ -922,11 +943,12 @@ bool WebSocketContext::close(int code, const std::string& reason) {
 
     {
         std::lock_guard<std::mutex> lk(send_queue_mutex);
-        if (send_queue.size() >= MAX_QUEUE_SIZE) {
+        if (send_queue.size() >= MAX_QUEUE_SIZE || payload.size() > MAX_PENDING_BYTES - send_queue_bytes) {
             log_error("Send queue full—dropping CLOSE");
             requestLoopExit();
             return false;
         }
+        send_queue_bytes += payload.size();
         send_queue.emplace_back(std::move(payload), Pending::Close);
     }
     
@@ -938,67 +960,51 @@ bool WebSocketContext::close(CloseCode code, const std::string& reason) {
     return close(static_cast<int>(code), reason);
 }
 
-bool WebSocketContext::sendData(const void* data, size_t length, MessageType type) {
-    ConnectionState state = connection_state.load(std::memory_order_acquire);
-
-    if (type == MessageType::CLOSE) return false;
-    
-    // While CONNECTING: queue only
-    if (state == ConnectionState::CONNECTING) {
-        std::lock_guard<std::mutex> lk(send_queue_mutex);
-        if (send_queue.size() >= MAX_QUEUE_SIZE) {
-            log_error("Send queue full—dropping packet");
-            return false;
-        }
-        if (type == MessageType::TEXT) {
-            send_queue.emplace_back(
-                std::string(reinterpret_cast<const char*>(data), length)
-            );
-        } else {
-            send_queue.emplace_back(
-                std::vector<uint8_t>(
-                    reinterpret_cast<const uint8_t*>(data),
-                    reinterpret_cast<const uint8_t*>(data) + length
-                )
-            );
-        }
-
-        log_debug("Queued %zu bytes during CONNECTING", length);
-
-        return true;
+bool WebSocketContext::checkSendOverflow() {
+    if (!send_overflow.load(std::memory_order_acquire)) return false;
+    if (!send_overflow_reported) {
+        send_overflow_reported = true;
+        // Abort instead of dropping arbitrary audio or control messages. Only
+        // the event thread delivers callbacks and initiates transport teardown.
+        connection_state.store(ConnectionState::DISCONNECTING, std::memory_order_release);
+        requestLoopExit();
+        sendError(ErrorCode::IO, "Outgoing WebSocket buffer limit exceeded (1 MiB); peer is not keeping up");
     }
+    return true;
+}
 
-    // After CONNECTING:
-    // Only event thread sends.
-    if (std::this_thread::get_id() == event_tid) {
+bool WebSocketContext::sendData(const void* data, size_t length, MessageType type) {
+    const auto state = connection_state.load(std::memory_order_acquire);
+    if (type == MessageType::CLOSE || stop_requested.load(std::memory_order_acquire) ||
+        send_overflow.load(std::memory_order_acquire) ||
+        (state != ConnectionState::CONNECTING && state != ConnectionState::CONNECTED)) return false;
+
+    if (std::this_thread::get_id() == event_tid && state == ConnectionState::CONNECTED) {
         return sendNow(data, length, type);
     }
 
-    // Not event thread: queue and poke event loop (send_event)
+    bool overflow = false;
     {
         std::lock_guard<std::mutex> lk(send_queue_mutex);
-        if (send_queue.size() >= MAX_QUEUE_SIZE) {
-            log_error("Send queue full—dropping packet");
-            return false;
-        }
-
-        if (type == MessageType::TEXT) {
-            send_queue.emplace_back(
-                std::string(reinterpret_cast<const char*>(data), length)
-            );
+        // Check before copying, using subtraction so oversized lengths cannot
+        // wrap the accounting. Include both text and binary payloads.
+        if (send_overflow.load(std::memory_order_acquire)) return false;
+        overflow = send_queue.size() >= MAX_QUEUE_SIZE || length > MAX_PENDING_BYTES - send_queue_bytes;
+        if (overflow) {
+            send_overflow.store(true, std::memory_order_release);
         } else {
-            send_queue.emplace_back(
-                std::vector<uint8_t>(
-                    reinterpret_cast<const uint8_t*>(data),
-                    reinterpret_cast<const uint8_t*>(data) + length
-                )
-            );
+            if (type == MessageType::TEXT) {
+                send_queue.emplace_back(std::string(static_cast<const char*>(data), length));
+            } else {
+                const auto* bytes = static_cast<const uint8_t*>(data);
+                send_queue.emplace_back(std::vector<uint8_t>(bytes, bytes + length));
+            }
+            send_queue_bytes += length;
         }
     }
-
-    requestSendFlush();
-
-    return true;
+    if (overflow) requestWakeup();
+    else if (state == ConnectionState::CONNECTED) requestSendFlush();
+    return !overflow;
 }
 
 bool WebSocketContext::sendNow(const void* data, size_t length, MessageType type) {
@@ -1031,17 +1037,25 @@ bool WebSocketContext::sendNow(const void* data, size_t length, MessageType type
         return false;
     }
 
-    send(output, data, length, type);
-
-    return true;
+    return send(output, data, length, type);
 }
 
-void WebSocketContext::send(evbuffer* buf, const void* raw_data, size_t raw_len, MessageType type) {
+bool WebSocketContext::send(evbuffer* buf, const void* raw_data, size_t raw_len, MessageType type) {
     const bool is_control_frame = (type == MessageType::CLOSE || type == MessageType::PING  || type == MessageType::PONG);
 
     if (is_control_frame && raw_len > 125) {
         log_error("Control frame too large (%zu bytes)", raw_len);
-        return;
+        return false;
+    }
+
+    if (checkSendOverflow()) return false;
+    // Bound input before compression/masking allocations and reject a backlog
+    // before advancing the compression state. Include the largest frame header.
+    const size_t buffered = evbuffer_get_length(buf);
+    if (raw_len > MAX_OUTPUT_BYTES - 14 || buffered > MAX_OUTPUT_BYTES - 14 - raw_len) {
+        send_overflow.store(true, std::memory_order_release);
+        checkSendOverflow();
+        return false;
     }
 
     const uint8_t* original_ptr = static_cast<const uint8_t*>(raw_data);
@@ -1054,6 +1068,13 @@ void WebSocketContext::send(evbuffer* buf, const void* raw_data, size_t raw_len,
     bool do_compress = false;
 
     receiver.txPrepare(original_ptr, original_len, request_compress, payload_ptr, payload_len, do_compress);
+
+    // Compression may expand a payload. Check the actual wire size as well.
+    if (payload_len > MAX_OUTPUT_BYTES - 14 || buffered > MAX_OUTPUT_BYTES - 14 - payload_len) {
+        send_overflow.store(true, std::memory_order_release);
+        checkSendOverflow();
+        return false;
+    }
 
     uint8_t b1 = 0x80; // FIN
     if (do_compress) b1 |= 0x40; // RSV1
@@ -1129,6 +1150,7 @@ void WebSocketContext::send(evbuffer* buf, const void* raw_data, size_t raw_len,
 
     // Add
     evbuffer_add(out, masked.data(), masked.size());
+    return true;
 }
 
 void WebSocketContext::sendPing() {

@@ -131,7 +131,7 @@ private:
 
     bool close(int code = 1000, const std::string& reason = "Normal closure");
     bool close(CloseCode code, const std::string& reason);
-    void send(evbuffer* buf, const void* data, size_t len, MessageType type = MessageType::TEXT);
+    bool send(evbuffer* buf, const void* data, size_t len, MessageType type = MessageType::TEXT);
 
     bool sendNow(const void* data, size_t length, MessageType type);    //event thread only
     void stopNow();
@@ -162,6 +162,12 @@ private:
     BinaryCallback on_binary;
 
     static const size_t MAX_QUEUE_SIZE = 1024;
+    static const size_t MAX_PENDING_BYTES = 1024 * 1024;
+    static const size_t MAX_OUTPUT_BYTES = 1024 * 1024;
+    size_t send_queue_bytes = 0; // guarded by send_queue_mutex
+    std::atomic<bool> send_overflow{false};
+    bool send_overflow_reported = false; // event thread only
+    bool checkSendOverflow();
 
     // Pending queue
     struct Pending {
