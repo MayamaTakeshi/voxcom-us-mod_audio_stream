@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cstring>
 
+static constexpr size_t MAX_INCOMING_BYTES = 1024 * 1024;
+
 #include "Logger.h"
 
 WebSocketReceiver::WebSocketReceiver(IWebSocketSinks& sinks) : _sinks(sinks) {}
@@ -278,6 +280,7 @@ bool WebSocketReceiver::rxInflate(const uint8_t* in, size_t in_len, std::vector<
         size_t produced = sizeof(tmp) - inflate_stream.avail_out;
         
         if (produced) {
+            if (produced > MAX_INCOMING_BYTES - out.size()) return false;
             const size_t old = out.size();
             out.resize(old + produced);
             std::memcpy(out.data() + old, tmp, produced);
@@ -359,6 +362,10 @@ void WebSocketReceiver::onData(evbuffer* buf) {
             return;
         }
 
+        if (payload_len > MAX_INCOMING_BYTES) {
+            _sinks.onRxProtocolError(1009, "Incoming frame exceeds 1 MiB");
+            return;
+        }
         const size_t need = header_len + static_cast<size_t>(payload_len);
         if (data_len < need) break; // wait for full frame
 
@@ -407,6 +414,10 @@ void WebSocketReceiver::handleContinuationFrame(const unsigned char* payload, si
         return;
     }
 
+    if (payload_len > MAX_INCOMING_BYTES - fragmented_message.size()) {
+        _sinks.onRxProtocolError(1009, "Incoming message exceeds 1 MiB");
+        return;
+    }
     fragmented_message.insert(fragmented_message.end(),
                               payload,
                               payload + payload_len);

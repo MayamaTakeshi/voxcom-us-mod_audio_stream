@@ -35,6 +35,8 @@ def serve_one(listener, context, mode):
         headers = dict(line.split(b":", 1) for line in request.split(b"\r\n")[1:] if b":" in line)
         accept = base64.b64encode(hashlib.sha1(headers[b"Sec-WebSocket-Key"].strip()
                                              + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+        if mode == "bad_accept":
+            accept = b"invalid"
         extension = (b"Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n"
                      if mode == "expansion" else b"")
         conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
@@ -75,7 +77,7 @@ if __name__ == "__main__":
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls.load_cert_chain(cert, key)
         for secure in (False, True):
-            for mode in ("normal", "queue", "oversized", "output", "expansion"):
+            for mode in ("normal", "queue", "oversized", "output", "expansion", "bad_accept"):
                 stopped = threading.Event()
                 with socket.socket() as listener:
                     listener.bind(("127.0.0.1", 0))

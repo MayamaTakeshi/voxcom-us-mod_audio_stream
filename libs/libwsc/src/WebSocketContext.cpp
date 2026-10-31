@@ -138,6 +138,7 @@ void WebSocketContext::start() {
 void WebSocketContext::run() {
 
     event_tid = std::this_thread::get_id();
+    if (stop_requested.load(std::memory_order_acquire)) return;
 
     /*std::ostringstream oss;
     oss << event_tid;
@@ -287,6 +288,10 @@ void WebSocketContext::run() {
         return;
     }
 
+    if (stop_requested.load(std::memory_order_acquire)) {
+        cleanup();
+        return;
+    }
     running.store(true, std::memory_order_release);
     event_base_dispatch(base);
 
@@ -450,12 +455,8 @@ void WebSocketContext::readCallback(bufferevent* bev, void* ctx) {
 }
 
 inline void WebSocketContext::requestWakeup() {
-    event* ev = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(base_mutex);
-        ev = wakeup_event;
-    }
-    if (ev) event_active(ev, 0, 0);
+    std::lock_guard<std::mutex> lk(base_mutex);
+    if (wakeup_event) event_active(wakeup_event, 0, 0);
 }
 
 inline void WebSocketContext::requestLoopExit() {
@@ -478,13 +479,9 @@ inline void WebSocketContext::requestSendFlush()
     if (send_flush_pending.exchange(true, std::memory_order_acq_rel))
         return;
 
-    event* ev = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(base_mutex);
-        ev = send_event;
-    }
-    if (ev) {
-        event_active(ev, 0, 0);
+    std::lock_guard<std::mutex> lk(base_mutex);
+    if (send_event) {
+        event_active(send_event, 0, 0);
     } else {
         // couldn't schedule, allow future attempts
         send_flush_pending.store(false, std::memory_order_release);
@@ -675,26 +672,72 @@ void WebSocketContext::handleRead(bufferevent* bev) {
 
         const size_t len = evbuffer_get_length(input);
         if (len < 4) return;
-
-        std::vector<char> snap(len);
-        evbuffer_copyout(input, snap.data(), len);
+        const size_t headerLimit = 65536;
+        const size_t scanLength = std::min(len, headerLimit);
+        std::vector<char> snap(scanLength);
+        evbuffer_copyout(input, snap.data(), scanLength);
         const char* b = snap.data();
             
         // Find end of headers: "\r\n\r\n" (length-bounded)
         size_t headerBytes = 0;
-        for (size_t i = 0; i + 3 < len; ++i) {
+        for (size_t i = 0; i + 3 < scanLength; ++i) {
             if (b[i] == '\r' && b[i+1] == '\n' && b[i+2] == '\r' && b[i+3] == '\n') {
                 headerBytes = i + 4;
                 break;
             }
         }
-        if (headerBytes == 0) return;
+        if (headerBytes == 0) {
+            if (len >= headerLimit) {
+                sendError(ErrorCode::PROTOCOL, "WebSocket upgrade headers exceed 64 KiB");
+                requestLoopExit();
+            }
+            return;
+        }
         std::string resp(b, headerBytes);
 
         //log_debug("RESP: %s", resp.c_str());
 
-        if (resp.find("HTTP/1.1 101", 0) == std::string::npos ||
-            !containsHeader(resp, "Sec-WebSocket-Accept:"))
+        auto header = [&](const std::string& name) {
+            std::string value;
+            size_t pos = resp.find("\r\n") + 2;
+            while (pos < resp.size()) {
+                size_t end = resp.find("\r\n", pos);
+                if (end == std::string::npos || end == pos) break;
+                size_t colon = resp.find(':', pos);
+                if (colon < end) {
+                    std::string key = resp.substr(pos, colon - pos);
+                    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::tolower(c); });
+                    if (key == name) {
+                        if (!value.empty()) return std::string();
+                        value = resp.substr(colon + 1, end - colon - 1);
+                        size_t first = value.find_first_not_of(" \t");
+                        size_t last = value.find_last_not_of(" \t");
+                        value = first == std::string::npos ? "" : value.substr(first, last - first + 1);
+                    }
+                }
+                pos = end + 2;
+            }
+            return value;
+        };
+        auto hasHeaderToken = [&](const std::string& name, const std::string& token) {
+            std::string value = header(name);
+            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::tolower(c); });
+            size_t pos = 0;
+            while (pos < value.size()) {
+                size_t end = value.find(',', pos);
+                if (end == std::string::npos) end = value.size();
+                std::string part = value.substr(pos, end - pos);
+                size_t first = part.find_first_not_of(" \t");
+                size_t last = part.find_last_not_of(" \t");
+                if (first != std::string::npos && part.substr(first, last - first + 1) == token) return true;
+                pos = end + 1;
+            }
+            return false;
+        };
+        if (resp.compare(0, 13, "HTTP/1.1 101 ") != 0 ||
+            header("sec-websocket-accept") != accept ||
+            !hasHeaderToken("upgrade", "websocket") ||
+            !hasHeaderToken("connection", "upgrade"))
         {
             log_error("WebSocket upgrade failed");
             connection_state.store(ConnectionState::FAILED, std::memory_order_release);

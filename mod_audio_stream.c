@@ -202,11 +202,32 @@ SWITCH_STANDARD_API(stream_function)
 
     if (!zstr(cmd) && (mycmd = strdup(cmd)))
     {
-        argc = switch_separate_string(mycmd, ' ', argv, (sizeof(argv) / sizeof(argv[0])));
+        /* Split the command prefix only. Payloads are opaque UTF-8 bytes;
+           FreeSWITCH's general tokenizer removes JSON escapes and quotes. */
+        char *cursor = mycmd;
+        while (*cursor && argc < 2) {
+            while (*cursor == ' ') ++cursor;
+            if (!*cursor) break;
+            argv[argc++] = cursor;
+            while (*cursor && *cursor != ' ') ++cursor;
+            if (*cursor) *cursor++ = '\0';
+        }
+        if (argc == 2) {
+            if (!strcasecmp(argv[1], "start")) {
+                while (*cursor && argc < 5) {
+                    while (*cursor == ' ') ++cursor;
+                    if (!*cursor) break;
+                    argv[argc++] = cursor;
+                    while (*cursor && *cursor != ' ') ++cursor;
+                    if (*cursor) *cursor++ = '\0';
+                }
+            }
+            if (*cursor && argc < 6) argv[argc++] = cursor;
+        }
     }
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "mod_audio_stream cmd: %s\n", cmd ? cmd : "");
 
-    if (zstr(cmd) || argc < 2 || (0 == strcmp(argv[1], "start") && argc < 4))
+    if (zstr(cmd) || argc < 2 || (!strcasecmp(argv[1], "start") && argc < 4))
     {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error with command %s %s %s.\n", cmd ? cmd : "", argv[0] ? argv[0] : "", argv[1] ? argv[1] : "");
         stream->write_function(stream, "-USAGE: %s\n", STREAM_API_SYNTAX);

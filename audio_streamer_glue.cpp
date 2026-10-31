@@ -86,9 +86,15 @@ public:
         client.sendBinary(buffer, len);
     }
 
-    void writeText(const char* text) {
-        if(!this->isConnected()) return;
-        client.sendMessage(text, strlen(text));
+    bool writeText(const char* text) {
+        return client.sendMessage(text, strlen(text));
+    }
+
+    void padIdleAudio(switch_core_session_t* session) {
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const auto last = m_lastInjectMs.load(std::memory_order_acquire);
+        if (last && now - last > AUDIO_BURST_GAP_MS) padWriteBuffer(session);
     }
 
     /* Hands the queued messages over to the socket. The websocket layer keeps
@@ -234,6 +240,11 @@ private:
             if (!self->isCleanedUp()) {
                 auto* session = switch_core_session_locate(self->m_sessionId.c_str());
                 if (session) {
+                    if (self->isCleanedUp()) {
+                        switch_core_session_rwunlock(session);
+                        self->leaveCallback();
+                        return;
+                    }
                     // Binary audio has no format header: use the rate/channels
                     // negotiated by uuid_audio_stream start, including NUL bytes.
                     self->receiveRawAudio(session, static_cast<const uint8_t*>(data),
@@ -469,8 +480,8 @@ private:
 
         /* Resampling runs outside the session mutex: it only touches the
            resampler, which is used by this thread alone. */
-        SpeexResamplerState* resampler = tech_pvt->write_resampler;
-        if (inRate != outRate && inRate != tech_pvt->wsSampling) {
+        SpeexResamplerState* resampler = nullptr;
+        if (inRate != outRate) {
             resampler = get_write_resampler(inRate, session);
             if (!resampler) {
                 return;
@@ -572,6 +583,10 @@ private:
             return;
         }
 
+        if (isCleanedUp()) {
+            switch_core_session_rwunlock(psession);
+            return;
+        }
         for (const auto& e : pr.errors) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_ERROR, "%s\n", e.c_str());
         }
@@ -998,11 +1013,9 @@ namespace {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing read resampler: %s.\n", speex_resampler_strerror(err));
                 return SWITCH_STATUS_FALSE;
             }
-            tech_pvt->write_resampler = speex_resampler_init(channels, desiredSampling, sampling, SWITCH_RESAMPLE_QUALITY, &err);
-            if (0 != err) {
-                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing write resampler: %s.\n", speex_resampler_strerror(err));
-                return SWITCH_STATUS_FALSE;
-            }
+            // Receive resamplers belong to AudioStreamer: an in-flight callback
+            // keeps them alive even when session cleanup times out.
+
         }
         else {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) no resampling needed for this call\n", tech_pvt->sessionId);
@@ -1076,7 +1089,7 @@ extern "C" {
         if (impl->samples_per_packet == 0) {
             return SWITCH_FALSE;
         }
-        if ((impl->decoded_bytes_per_packet / impl->samples_per_packet) != 2) {
+        if ((impl->decoded_bytes_per_packet / impl->samples_per_packet) != 2 * impl->number_of_channels) {
             return SWITCH_FALSE;
         }
         if (impl->number_of_channels == 0) {
@@ -1237,8 +1250,7 @@ extern "C" {
         switch_mutex_unlock(tech_pvt->mutex);
 
         if (streamer) {
-            streamer->writeText(text);
-            return SWITCH_STATUS_SUCCESS;
+            return streamer->writeText(text) ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
         }
 
         return SWITCH_STATUS_FALSE;
@@ -1621,25 +1633,42 @@ extern "C" {
            only such frames may be replaced, anything else would be encoded as
            noise. */
         switch_core_session_t *session = switch_core_media_bug_get_session(bug);
-        if (frame_is_session_pcm(session, caller_frame, tech_pvt->sampling, tech_pvt->channels) == SWITCH_FALSE) {
+        if (frame_is_session_pcm(session, caller_frame, tech_pvt->sampling, 0) == SWITCH_FALSE) {
             switch_mutex_unlock(tech_pvt->mutex);
             return SWITCH_TRUE;
         }
 
-        const size_t bytes = caller_frame->datalen;
-        if (tech_pvt->inject_scratch_size < bytes) {
+        const unsigned playback_channels = caller_frame->codec->implementation->number_of_channels;
+        const size_t output_bytes = caller_frame->datalen;
+        const size_t samples = output_bytes / (2 * playback_channels);
+        const size_t bytes = samples * 2 * tech_pvt->channels;
+        if ((playback_channels != 1 && playback_channels != 2) ||
+            output_bytes % (2 * playback_channels) ||
+            tech_pvt->inject_scratch_size < std::max(bytes, output_bytes)) {
             switch_mutex_unlock(tech_pvt->mutex);
             return SWITCH_TRUE;
         }
 
         size_t consumed = 0;
         switch_mutex_lock(tech_pvt->write_mutex);
+        tech_pvt->write_frame_bytes = (uint32_t)bytes;
+        if (tech_pvt->pAudioStreamer) {
+            auto* owner = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
+            if (*owner) (*owner)->padIdleAudio(session);
+        }
         if (switch_buffer_inuse(tech_pvt->write_sbuffer) >= bytes) {
             consumed = switch_buffer_read(tech_pvt->write_sbuffer, tech_pvt->inject_scratch, bytes);
         }
         switch_mutex_unlock(tech_pvt->write_mutex);
 
         if (consumed == bytes) {
+            auto* pcm = reinterpret_cast<int16_t*>(tech_pvt->inject_scratch);
+            if (tech_pvt->channels == 2 && playback_channels == 1) {
+                for (size_t i = 0; i < samples; ++i)
+                    pcm[i] = (int16_t)(((int32_t)pcm[2*i] + pcm[2*i+1]) / 2);
+            } else if (tech_pvt->channels == 1 && playback_channels == 2) {
+                for (size_t i = samples; i > 0; --i) pcm[2*i-1] = pcm[2*i-2] = pcm[i-1];
+            }
             /* Hand back a module owned frame. The frame owned by the writer is
                never modified, FreeSWITCH picks up write_replace_frame_out after
                the callback returned. */
@@ -1647,8 +1676,8 @@ extern "C" {
             frame->codec = caller_frame->codec;
             frame->channels = caller_frame->channels;
             frame->rate = caller_frame->rate;
-            frame->samples = (uint32_t)(bytes / 2 / tech_pvt->channels);
-            frame->datalen = (uint32_t)bytes;
+            frame->samples = (uint32_t)samples;
+            frame->datalen = (uint32_t)output_bytes;
             frame->data = tech_pvt->inject_scratch;
             frame->buflen = tech_pvt->inject_scratch_size;
             switch_core_media_bug_set_write_replace_frame(bug, frame);

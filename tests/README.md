@@ -31,3 +31,16 @@ fits the raw input limit but exceeds the wire limit after compression.
 Overflow cases require one error callback, send rejection and successful cleanup.
 The output-buffer case exercises direct sends from the event thread, which bypass
 the application queue. Normal traffic must complete without an error callback.
+
+Additional review regressions:
+
+```sh
+python3 tests/test_command_payload.py
+build/backpressure-tests/receiver_limits
+```
+
+The receiver executable checks oversized 64-bit frame lengths, aggregate
+fragment limits, and decompression expansion. The network suite also rejects
+invalid handshake accept values over both ws and wss. Command parsing tests
+compile the actual module parser block and check spaces, apostrophes, and JSON
+escapes. Live-call validation is still needed for playback and teardown timing.
